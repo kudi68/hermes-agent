@@ -1,0 +1,26 @@
+# C1 Telegram 部署 Checklist
+
+**狀態：僅準備，未部署。** 今晚不裝金鑰、不重啟、不解閘、不送 live 訊息。候選分支 `chief-c1-patch`，目前程式 HEAD `1a2d409b87cb63e4b1542bde3cc0208eff0afe62`。
+
+## 部署前停止條件
+
+- [ ] 已審查並整合 Hermes 候選與正式 C1 binding；目前候選只呼叫 `post_gateway_admission` hook，沒有 production hook registration。
+- [ ] PR #15 的 production admission proof 已補齊。若仍回報 `TRUSTED_ADMISSION_BOUNDARY_UNPROVEN`，保持 fail-closed，不解閘；`C1_RUNTIME_PASS=false`。
+- [ ] 已確認 serving Gateway 與 Profile。多 Profile 環境只重啟實際承載 `chief` 的 Gateway。
+- [ ] 已確認 HMAC secret lookup 名稱與來源。候選目前沒有 production secret 欄位；未定義前不可安裝金鑰或啟用 binding。
+
+## 設定與順序
+
+1. **既有 Telegram bot：**沿用現有 bot，不建立新 bot/token。Hermes 使用 `TELEGRAM_BOT_TOKEN` 與 `TELEGRAM_ALLOWED_USERS`；只允許已核實的 Owner 數字 user ID，不使用 `*`。只核對是否存在，不輸出值。
+2. **Profile 範圍：**設定留在 `chief` 的 profile-scoped secret store（named profile 預設位於 `~/.hermes/profiles/chief/.env`；以實際 `HERMES_HOME` 為準）。不可寫到 `default` 或全域環境。
+3. **HMAC 根金鑰：**最多新增一把，值一律遮蔽。預定位置為 `chief` profile secret store；精確欄位／lookup 尚未定義，先完成 binding 並驗證讀取來源，再安裝。
+4. 記錄目前 Hermes 版本、候選 commit、Gateway serving Profile 與回復版本；保存不含秘密值的現況紀錄。
+5. 在核准的維護時段套用已審查程式與 binding，確認 allowlist 與可信 Telegram principal proof 都映射到 `human:kudi68`。
+6. 先讓 Gateway graceful drain，再以服務擁有者 Profile 執行 `hermes --profile <serving-profile> gateway restart`；等待 replacement process，接著以 `hermes --profile <serving-profile> gateway status` 確認健康與版本。
+7. 只有 production issuer、admission boundary、durable request identity 與 result routing 都有可讀證據後，才依已審查的正式操作解除 PR #15 閘門。**目前沒有確認可用的解閘命令；不得用手動改旗標替代證據。**
+
+## 單筆驗收與回退
+
+- 在既有 bot 的 Owner 私人對話，只送一次：`回傳 kudi68/personal-ai-os 的 NEXT.md 第一行`。保存回覆所屬的同一 `request_id`，並在 fresh session 對 durable C1 store 做 readback；只核對 receipt 狀態、conversation target 與 request identity，不保存私人回覆內容。
+- 無回覆、逾時或 `RETURN_UNCERTAIN` 時**不重送**；先以同一 `request_id` 做 readback。現有 fixture CLI 不是 production ingress/readback 證據，部署前須確認正式 readback 工具與 store 路徑。
+- 回退：先保持／恢復 fail-closed 閘門，停止新 binding；還原部署前 Hermes 版本與程式，移除本次新增的 HMAC secret（若已安裝），保留既有 Telegram bot token 與 allowlist；再 graceful restart 原 serving Gateway，確認狀態正常且 C1 未執行。
