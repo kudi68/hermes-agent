@@ -1223,7 +1223,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
                 is_c1_telegram_personal_target,
                 run_c1_telegram_personal,
             )
-            if is_c1_telegram_personal_target(event, source):
+            if is_c1_telegram_personal_target(event, source, self):
                 # Keep the existing Telegram lobby and drain gates, but consume this request
                 # before busy-session routing can queue it into an ordinary Agent turn.
                 if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):

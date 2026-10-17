@@ -1,7 +1,7 @@
 """Offline C1 Telegram dispatch tests; no bot credentials or live Gateway calls."""
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
 import json
@@ -21,6 +21,7 @@ from gateway.session import SessionSource
 
 TEST_KEY = b"MODELLED-only-telegram-c1-test-key-32-bytes"
 OWNER_TELEGRAM_USER_ID = "424242"
+TEST_NOW = datetime(2026, 10, 15, 10, 0, tzinfo=UTC)
 
 
 def _canonical(value):
@@ -181,12 +182,14 @@ def _set_hook(callback):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_hook_registry():
+def _isolate_hook_registry(monkeypatch):
     from hermes_cli.plugins import get_plugin_manager
 
     manager = get_plugin_manager()
     manager._hooks.pop(POST_ADMISSION_HOOK, None)
     manager._discovered = True
+    # Model time, transport authorization and binding; these are not live-ingress proofs.
+    monkeypatch.setattr("gateway.run_inbound_consumer._utc_now", lambda: TEST_NOW, raising=False)
     yield
     manager._hooks.pop(POST_ADMISSION_HOOK, None)
 
@@ -208,7 +211,7 @@ def _event(
 ):
     raw_user_id = int(user_id) if raw_user_id is None else raw_user_id
     raw_chat_id = chat_id if raw_chat_id is None else raw_chat_id
-    date = date or datetime(2026, 10, 15, 10, 0, tzinfo=timezone.utc)
+    date = date or TEST_NOW
     raw = SimpleNamespace(
         chat=SimpleNamespace(id=raw_chat_id, type=chat_type),
         from_user=SimpleNamespace(id=raw_user_id, is_bot=False),
@@ -235,7 +238,7 @@ def _event(
     )
 
 
-def _runner():
+def _runner(profile="chief"):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
@@ -245,6 +248,8 @@ def _runner():
     )
     adapter = SimpleNamespace(send=AsyncMock())
     runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._primary_profile_name = profile
+    runner._transport_owner = lambda _source: None
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner._is_user_authorized_for_source = lambda _source: True
@@ -348,7 +353,7 @@ async def test_other_profile_keeps_the_normal_agent_path():
     c1 = FakeDurableC1(gateway)
     binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
     _set_hook(binding)
-    runner = _runner()
+    runner = _runner(profile="default")
 
     result = await runner._handle_message(_event(profile="default"))
 
@@ -490,3 +495,136 @@ async def test_return_uncertain_is_never_retried_after_binding_restart():
     assert restarted_c1.executions == 0
     assert restarted_gateway.sends == []
     assert replay_binding.identities[0] == first_binding.identities[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_profile", ["chief", "default", "other"])
+async def test_none_source_profile_uses_the_canonical_runtime_profile(runtime_profile):
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    _set_hook(binding)
+    runner = _runner(profile=runtime_profile)
+
+    result = await runner._handle_message(_event(profile=None))
+
+    if runtime_profile == "chief":
+        assert result is None
+        runner._handle_message_with_agent.assert_not_awaited()
+        assert c1.executions == 1
+    else:
+        assert result == "agent-reply"
+        runner._handle_message_with_agent.assert_awaited_once()
+        assert c1.executions == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_profile,wire_profile", [("chief", "other"), ("other", "chief")])
+async def test_pinned_runtime_identity_wins_over_the_wire_profile(tmp_path, runtime_profile, wire_profile):
+    from gateway.session_identity import RoutingIdentity
+
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    _set_hook(FakeC1Binding(FakeGatewayC1Adapter(c1)))
+    runner = _runner(profile="chief")
+    event = _event(profile=wire_profile)
+    event.source._identity = RoutingIdentity(
+        transport_profile="chief", runtime_profile=runtime_profile,
+        authorization_home=tmp_path, runtime_home=tmp_path, multiplexed=False,
+    )
+
+    result = await runner._handle_message(event)
+
+    assert c1.executions == (1 if runtime_profile == "chief" else 0)
+    assert result == (None if runtime_profile == "chief" else "agent-reply")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_profile", ["chief", "other"])
+async def test_multiplex_request_uses_the_canonical_home(tmp_path, runtime_profile):
+    from gateway.run import _profile_runtime_scope
+    from gateway.session_identity import RoutingIdentity
+    from hermes_constants import get_hermes_home
+
+    launch, routed = tmp_path / "launch", tmp_path / "routed"
+    launch.mkdir()
+    routed.mkdir()
+    seen_homes = []
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+
+    def scoped_binding(**kwargs):
+        seen_homes.append(get_hermes_home())
+        return binding(**kwargs)
+
+    runner = _runner(profile="default")
+    runner.config.multiplex_profiles = True
+    event = _event(profile=runtime_profile)
+    event.source._identity = RoutingIdentity(
+        transport_profile="default", runtime_profile=runtime_profile,
+        authorization_home=launch, runtime_home=routed,
+    )
+    with _profile_runtime_scope(routed):
+        _set_hook(scoped_binding)
+    with _profile_runtime_scope(launch):
+        result = await runner._handle_message(event)
+        assert get_hermes_home() == launch
+
+    assert seen_homes == [routed]
+    assert result == (None if runtime_profile == "chief" else "agent-reply")
+    assert c1.executions == (1 if runtime_profile == "chief" else 0)
+
+
+@pytest.mark.asyncio
+async def test_missing_binding_consumes_without_agent_fallback():
+    runner = _runner()
+
+    assert await runner._handle_message(_event()) is None
+
+    runner._handle_message_with_agent.assert_not_awaited()
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_binding_error_consumes_without_agent_fallback():
+    calls = []
+
+    def broken(**_kwargs):
+        calls.append("entered")
+        raise RuntimeError("offline binding failure")
+
+    _set_hook(broken)
+    runner = _runner()
+
+    assert await runner._handle_message(_event()) is None
+
+    assert calls == ["entered"]
+    runner._handle_message_with_agent.assert_not_awaited()
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offset", [timedelta(minutes=-10), timedelta(seconds=-301), timedelta(seconds=31)])
+async def test_expired_or_implausibly_future_request_never_reaches_binding(offset):
+    calls = []
+    _set_hook(lambda **kwargs: calls.append(kwargs))
+    runner = _runner()
+
+    assert await runner._handle_message(_event(date=TEST_NOW + offset)) is None
+
+    assert calls == []
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offset", [timedelta(minutes=-5), timedelta(seconds=30)])
+async def test_request_at_time_boundaries_is_admitted(offset):
+    calls = []
+    _set_hook(lambda **kwargs: calls.append(kwargs))
+    runner = _runner()
+
+    assert await runner._handle_message(_event(date=TEST_NOW + offset)) is None
+
+    assert len(calls) == 1
+    runner._handle_message_with_agent.assert_not_awaited()

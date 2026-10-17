@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import logging
@@ -28,6 +28,8 @@ POST_ADMISSION_HOOK = "post_gateway_admission"
 C1_TELEGRAM_PROFILE = "chief"
 C1_TELEGRAM_REQUEST = "回傳 kudi68/personal-ai-os 的 NEXT.md 第一行"
 C1_TELEGRAM_HOOK_TIMEOUT_SECONDS = 45
+# Telegram timestamps have second precision; tolerate a small sender/host clock skew.
+C1_TELEGRAM_FUTURE_SKEW_SECONDS = 30
 _C1_TELEGRAM_IDENTITY_SCHEMA = "hermes-telegram-message-identity-v1"
 
 
@@ -72,18 +74,30 @@ def _canonical_digest(value: dict) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def is_c1_telegram_personal_target(event: Any, source: Any) -> bool:
-    """Identify the fixed chief request before plugins can rewrite its visible text."""
+def is_c1_telegram_personal_target(event: Any, source: Any, runner: Any) -> bool:
+    """Use the canonical runtime identity; a primary profile can be None on the wire."""
     platform = getattr(getattr(source, "platform", None), "value", None)
     raw_text = getattr(getattr(event, "raw_message", None), "text", None)
-    return (
+    fixed_request = (
         platform == "telegram"
-        and getattr(source, "profile", None) == C1_TELEGRAM_PROFILE
         and (
             getattr(event, "text", None) == C1_TELEGRAM_REQUEST
             or raw_text == C1_TELEGRAM_REQUEST
         )
     )
+    if not fixed_request:
+        return False
+    from gateway.session_identity import IdentityUnresolved, canonical_identity
+
+    identity = canonical_identity(source, runner=runner)
+    if identity is None:
+        # An unresolved fixed request must never become an ordinary agent turn.
+        raise IdentityUnresolved("C1 Telegram runtime profile is unresolved")
+    return identity.runtime_profile == C1_TELEGRAM_PROFILE
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _telegram_c1_identity(event: Any, source: Any) -> dict | None:
@@ -140,8 +154,11 @@ def _telegram_c1_identity(event: Any, source: Any) -> dict | None:
         "chat_id": str(chat_id),
         "thread_id": thread_id,
     })
-    issued_at = message_date.astimezone(timezone.utc)
+    issued_at = message_date.astimezone(UTC)
     expires_at = issued_at + timedelta(minutes=5)
+    now = _utc_now()
+    if now > expires_at or issued_at > now + timedelta(seconds=C1_TELEGRAM_FUTURE_SKEW_SECONDS):
+        return None
     return {
         "schema": _C1_TELEGRAM_IDENTITY_SCHEMA,
         "event_id": "gateway-" + request_digest,
@@ -169,7 +186,7 @@ async def run_c1_telegram_personal(
     runner: Any, event: Any, source: Any, session_key: str
 ) -> tuple[bool, Optional[str]]:
     """Consume only the fixed chief Telegram request; never fall through on failure."""
-    if not is_c1_telegram_personal_target(event, source):
+    if not is_c1_telegram_personal_target(event, source, runner):
         return False, None
     platform = source.platform.value
 

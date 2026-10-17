@@ -1,6 +1,6 @@
 # C1 Telegram 部署 Checklist
 
-**狀態：僅準備，未部署。** 今晚不裝金鑰、不重啟、不解閘、不送 live 訊息。候選分支 `chief-c1-patch`，目前程式 HEAD `1a2d409b87cb63e4b1542bde3cc0208eff0afe62`。
+**狀態：僅準備，未部署。** 不裝金鑰、不重啟、不解閘、不送 live 訊息。候選分支 `chief-c1-patch`；精確程式 HEAD 以本地 `git rev-parse chief-c1-patch` 讀回（本輪修補基準 `9ff9d28f6a74aded5fbbba2600833952961ecb89`）；本地 commit 不代表遠端 PR 已更新。
 
 ## 部署前停止條件
 
