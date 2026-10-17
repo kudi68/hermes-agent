@@ -114,10 +114,13 @@ class C1DispatchClosed(RuntimeError):
 class C1TelegramDispatch:
     """Durable, at-most-once effect gate for a cooperative C1 binding.
 
-    A binding must explicitly accept ``c1_dispatch`` and put *all* irreversible
-    work inside its single ``run_effect`` call. This is a trusted-plugin contract,
-    not a sandbox for arbitrary Python. An effect already started may have an
-    uncertain outcome; abandoning a thread never proves that effect was cancelled.
+    A binding must explicitly accept ``c1_dispatch``. Check ``check_active`` before
+    admitting durable C1 work, and use ``run_effect`` at the actual return-transport
+    boundary, after preparation. Never wrap a whole workflow or queue deferred
+    work inside the effect: that would authorize a later send too early.
+    This is a trusted-plugin contract, not a Python sandbox. An already-started
+    transport operation may have an uncertain outcome; abandoning its thread
+    never proves that operation was cancelled.
     """
 
     def __init__(self, runtime_home: Path, identity: dict):
@@ -172,16 +175,22 @@ class C1TelegramDispatch:
                 (_utc_now().isoformat(), self.request_id),
             )
 
-    def run_effect(self, effect, *args, **kwargs):
-        """Authorize one effect before its deadline; a late callback cannot reauthorize it."""
+    def check_active(self) -> None:
+        """Reject late preparation before it admits durable work or claims the return."""
         if not self.claimed:
             raise C1DispatchClosed("replayed dispatch")
-        if inspect.iscoroutinefunction(effect):
-            self.uncertain()
-            raise C1DispatchClosed("effect must complete synchronously inside the gate")
         if time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
             self.uncertain()
             raise C1DispatchClosed("dispatch deadline expired")
+        if self.readback() != "DISPATCHING":
+            raise C1DispatchClosed("dispatch already claimed or uncertain")
+
+    def run_effect(self, effect, *args, **kwargs):
+        """Authorize one immediate transport operation; late callbacks cannot claim it."""
+        self.check_active()
+        if inspect.iscoroutinefunction(effect):
+            self.uncertain()
+            raise C1DispatchClosed("effect must complete synchronously inside the gate")
         with self._connect() as db:
             # BEGIN IMMEDIATE serializes timeout, replay and concurrent callback claims.
             db.execute("BEGIN IMMEDIATE")

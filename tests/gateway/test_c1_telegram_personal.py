@@ -85,8 +85,9 @@ class FakeDurableC1:
         self.gateway = gateway
         self.records = {}
         self.executions = 0
+        self.before_return = lambda: None
 
-    def handle(self, event, identity):
+    def handle(self, event, identity, *, c1_dispatch):
         if (
             event.get("text") != C1_TELEGRAM_REQUEST
             or event.get("principal") != "basic:kudi68"
@@ -105,18 +106,22 @@ class FakeDurableC1:
                 raise ValueError("REQUEST_ID_CONFLICT")
             return prior
 
+        c1_dispatch.check_active()
         record = FakeRecord(fingerprint=fingerprint, status="RETURN_INTENT")
         self.records[request_id] = record
         self.executions += 1
+        self.before_return()
         try:
-            receipt = self.gateway.send_result(
+            # Fence the actual send, not the entire C1 workflow before preparation.
+            receipt = c1_dispatch.run_effect(
+                self.gateway.send_result,
                 conversation_id=event["conversation_id"],
                 chat_id=proof["chat_id"],
                 thread_id=proof.get("thread_id"),
                 request_id=request_id,
                 text="NEXT first line",
             )
-        except TimeoutError:
+        except (TimeoutError, C1DispatchClosed):
             record.status = "RETURN_UNCERTAIN"
             return record
 
@@ -133,7 +138,7 @@ class FakeGatewayC1Adapter:
         self.verification_attempts = 0
         self.mapped_human = None
 
-    def handle(self, signed, identity, *, corrupt_signature=False):
+    def handle(self, signed, identity, *, c1_dispatch, corrupt_signature=False):
         self.verification_attempts += 1
         event = signed.get("event", {})
         signature = signed.get("signature", "")
@@ -148,7 +153,7 @@ class FakeGatewayC1Adapter:
         if proof.get("user_id") != OWNER_TELEGRAM_USER_ID:
             raise ValueError("PRINCIPAL_NOT_ALLOWED")
         self.mapped_human = "human:kudi68"
-        return self.durable_c1.handle(event, identity)
+        return self.durable_c1.handle(event, identity, c1_dispatch=c1_dispatch)
 
 
 class FakeC1Binding:
@@ -172,8 +177,9 @@ class FakeC1Binding:
             return None
         self.identities.append(identity)
         signed = _signed_event(identity)
-        c1_dispatch.run_effect(
-            self.gateway_c1.handle, signed, identity,
+        c1_dispatch.check_active()
+        self.gateway_c1.handle(
+            signed, identity, c1_dispatch=c1_dispatch,
             corrupt_signature=self.corrupt_signature,
         )
         # C1's receipt-aware return transport already sends the result.
@@ -913,5 +919,44 @@ async def test_binding_system_exit_is_contained_and_persisted_as_uncertain():
 
     assert await runner._handle_message(_event()) is None
 
+    assert dispatches[0].readback() == "UNCERTAIN"
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preparation_that_outlives_timeout_cannot_send_its_late_result(monkeypatch):
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    dispatches = []
+
+    def prepare():
+        entered.set()
+        assert release.wait(10)
+
+    def delayed_return(*, c1_dispatch, **kwargs):
+        dispatches.append(c1_dispatch)
+        try:
+            return binding(c1_dispatch=c1_dispatch, **kwargs)
+        finally:
+            finished.set()
+
+    c1.before_return = prepare
+    _set_hook(delayed_return)
+    monkeypatch.setattr("gateway.run_inbound_consumer.C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", 2)
+    runner = _runner()
+    try:
+        assert await runner._handle_message(_event()) is None
+        assert entered.is_set()
+        assert c1.executions == 1  # C1 admission started before the timeout.
+        assert gateway.sends == []
+        assert dispatches[0].readback() == "UNCERTAIN"
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+
+    assert gateway.sends == []
+    assert c1.records[binding.identities[0]["request_id"]].status == "RETURN_UNCERTAIN"
     assert dispatches[0].readback() == "UNCERTAIN"
     runner._handle_message_with_agent.assert_not_awaited()
