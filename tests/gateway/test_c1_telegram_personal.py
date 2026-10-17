@@ -1,5 +1,10 @@
-"""Offline C1 Telegram dispatch tests; no bot credentials or live Gateway calls."""
+"""Offline C1 Telegram dispatch tests; no bot credentials or live Gateway calls.
 
+Formal prereview probes: profile matrix, identity mismatch, missing binding,
+hook error, expired input and timeout effects. All ingress uses the real runner.
+"""
+
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -14,6 +19,8 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.run_inbound_consumer import (
+    C1DispatchClosed,
+    C1TelegramDispatch,
     C1_TELEGRAM_REQUEST,
     POST_ADMISSION_HOOK,
 )
@@ -153,7 +160,7 @@ class FakeC1Binding:
         self.calls = 0
         self.identities = []
 
-    def __call__(self, **kwargs):
+    def __call__(self, *, c1_dispatch=None, **kwargs):
         self.calls += 1
         identity = kwargs.get("telegram_identity")
         source = kwargs.get("source")
@@ -165,8 +172,9 @@ class FakeC1Binding:
             return None
         self.identities.append(identity)
         signed = _signed_event(identity)
-        self.gateway_c1.handle(
-            signed, identity, corrupt_signature=self.corrupt_signature
+        c1_dispatch.run_effect(
+            self.gateway_c1.handle, signed, identity,
+            corrupt_signature=self.corrupt_signature,
         )
         # C1's receipt-aware return transport already sends the result.
         return {"action": "handled"}
@@ -367,14 +375,18 @@ async def test_other_profile_keeps_the_normal_agent_path():
 async def test_hook_timeout_consumes_the_fixed_request_without_agent_fallback(monkeypatch):
     entered = threading.Event()
     release = threading.Event()
+    finished = threading.Event()
 
-    def blocks_until_released(**_kwargs):
+    def blocks_until_released(*, c1_dispatch, **_kwargs):
         entered.set()
-        release.wait()
+        try:
+            release.wait()
+        finally:
+            finished.set()
 
     _set_hook(blocks_until_released)
     monkeypatch.setattr(
-        "gateway.run_inbound_consumer.C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", 0.2
+        "gateway.run_inbound_consumer.C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", 2
     )
     monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.05)
     runner = _runner()
@@ -387,6 +399,7 @@ async def test_hook_timeout_consumes_the_fixed_request_without_agent_fallback(mo
         runner._handle_message_with_agent.assert_not_awaited()
     finally:
         release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
 
 
 @pytest.mark.asyncio
@@ -431,11 +444,12 @@ async def test_restart_replay_is_stable_and_distinct_messages_do_not_merge():
     await runner._handle_message(_event(update_id=900))
     await runner._handle_message(_event(message_id=18, update_id=901))
 
-    assert replay_binding.identities[0] == first_identity
-    assert replay_binding.identities[1]["request_id"] != first_request_id
+    # The ingress ledger suppresses replay even before a restarted binding runs.
+    assert len(replay_binding.identities) == 1
+    assert replay_binding.identities[0]["request_id"] != first_request_id
     assert restarted_c1.executions == 1
     assert len(restarted_gateway.sends) == 1
-    assert restarted_gateway.sends[0]["request_id"] == replay_binding.identities[1]["request_id"]
+    assert restarted_gateway.sends[0]["request_id"] == replay_binding.identities[0]["request_id"]
     assert len(durable_c1.records) == 2
 
 
@@ -494,7 +508,7 @@ async def test_return_uncertain_is_never_retried_after_binding_restart():
     assert len(first_gateway.sends) == 1
     assert restarted_c1.executions == 0
     assert restarted_gateway.sends == []
-    assert replay_binding.identities[0] == first_binding.identities[0]
+    assert replay_binding.identities == []
 
 
 @pytest.mark.asyncio
@@ -554,9 +568,9 @@ async def test_multiplex_request_uses_the_canonical_home(tmp_path, runtime_profi
     c1 = FakeDurableC1(gateway)
     binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
 
-    def scoped_binding(**kwargs):
+    def scoped_binding(*, c1_dispatch=None, **kwargs):
         seen_homes.append(get_hermes_home())
-        return binding(**kwargs)
+        return binding(c1_dispatch=c1_dispatch, **kwargs)
 
     runner = _runner(profile="default")
     runner.config.multiplex_profiles = True
@@ -590,7 +604,7 @@ async def test_missing_binding_consumes_without_agent_fallback():
 async def test_binding_error_consumes_without_agent_fallback():
     calls = []
 
-    def broken(**_kwargs):
+    def broken(*, c1_dispatch, **_kwargs):
         calls.append("entered")
         raise RuntimeError("offline binding failure")
 
@@ -605,10 +619,13 @@ async def test_binding_error_consumes_without_agent_fallback():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("offset", [timedelta(minutes=-10), timedelta(seconds=-301), timedelta(seconds=31)])
+@pytest.mark.parametrize("offset", [
+    timedelta(minutes=-10), timedelta(seconds=-301), timedelta(seconds=31),
+    timedelta(minutes=-5, microseconds=-1), timedelta(seconds=30, microseconds=1),
+])
 async def test_expired_or_implausibly_future_request_never_reaches_binding(offset):
     calls = []
-    _set_hook(lambda **kwargs: calls.append(kwargs))
+    _set_hook(lambda *, c1_dispatch, **kwargs: calls.append(kwargs))
     runner = _runner()
 
     assert await runner._handle_message(_event(date=TEST_NOW + offset)) is None
@@ -621,10 +638,280 @@ async def test_expired_or_implausibly_future_request_never_reaches_binding(offse
 @pytest.mark.parametrize("offset", [timedelta(minutes=-5), timedelta(seconds=30)])
 async def test_request_at_time_boundaries_is_admitted(offset):
     calls = []
-    _set_hook(lambda **kwargs: calls.append(kwargs))
+    _set_hook(lambda *, c1_dispatch, **kwargs: calls.append(kwargs))
     runner = _runner()
 
     assert await runner._handle_message(_event(date=TEST_NOW + offset)) is None
 
     assert len(calls) == 1
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_timeout_fences_late_callback_side_effects(monkeypatch):
+    """F2 counterexample: a timed-out thread must not later send a result."""
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    dispatches = []
+
+    def late_binding(*, c1_dispatch, **kwargs):
+        dispatches.append(c1_dispatch)
+        entered.set()
+        try:
+            if release.wait(10):
+                return binding(c1_dispatch=c1_dispatch, **kwargs)
+        finally:
+            finished.set()
+
+    _set_hook(late_binding)
+    monkeypatch.setattr("gateway.run_inbound_consumer.C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", 2)
+    # Isolate the outer timeout: the real callback still runs on the to_thread worker.
+    monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0)
+    runner = _runner()
+
+    try:
+        assert await runner._handle_message(_event()) is None
+        assert entered.is_set()
+        assert dispatches[0].readback() == "UNCERTAIN"
+        runner._handle_message_with_agent.assert_not_awaited()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+
+    assert gateway.sends == []
+    assert c1.executions == 0
+    assert dispatches[0].readback() == "UNCERTAIN"
+
+    # A new reader opens the persisted ledger without carrying the callback object.
+    dispatch = dispatches[0]
+    assert C1TelegramDispatch.read_request(dispatch.path.parent, dispatch.request_id)["status"] == "UNCERTAIN"
+
+    # A restarted consumer reads the persisted uncertain state and never retries it.
+    replay = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    _set_hook(replay)
+    await _runner()._handle_message(_event(update_id=999))
+    assert replay.calls == 0
+    assert gateway.sends == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["legacy", "ambiguous"])
+async def test_unfenced_or_ambiguous_binding_is_never_invoked(kind):
+    effects = []
+
+    def legacy(**_kwargs):
+        effects.append("unfenced")
+
+    def fenced(*, c1_dispatch, **_kwargs):
+        c1_dispatch.run_effect(effects.append, "fenced")
+
+    manager = _set_hook(legacy if kind == "legacy" else fenced)
+    if kind == "ambiguous":
+        manager._hooks[POST_ADMISSION_HOOK].append(fenced)
+    runner = _runner()
+
+    assert await runner._handle_message(_event()) is None
+
+    assert effects == []
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_callback_cannot_start_an_effect_after_message_expiry(monkeypatch):
+    effects, dispatches = [], []
+
+    def expired_preparation(*, c1_dispatch, **_kwargs):
+        dispatches.append(c1_dispatch)
+        monkeypatch.setattr(
+            "gateway.run_inbound_consumer._utc_now", lambda: TEST_NOW + timedelta(minutes=6)
+        )
+        c1_dispatch.run_effect(effects.append, "expired")
+
+    _set_hook(expired_preparation)
+    runner = _runner()
+
+    assert await runner._handle_message(_event()) is None
+
+    assert effects == []
+    assert dispatches[0].readback() == "UNCERTAIN"
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_binding_cannot_authorize_a_second_effect():
+    effects, dispatches = [], []
+
+    def twice(*, c1_dispatch, **_kwargs):
+        dispatches.append(c1_dispatch)
+        c1_dispatch.run_effect(effects.append, "first")
+        c1_dispatch.run_effect(effects.append, "second")
+
+    _set_hook(twice)
+
+    assert await _runner()._handle_message(_event()) is None
+
+    assert effects == ["first"]
+    assert dispatches[0].readback() == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
+async def test_late_effect_completion_cannot_clear_uncertain_or_retry(monkeypatch):
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    effects, dispatches = [], []
+
+    def in_flight_effect():
+        effects.append("started before timeout")
+        entered.set()
+        assert release.wait(10)
+
+    def binding(*, c1_dispatch, **_kwargs):
+        dispatches.append(c1_dispatch)
+        try:
+            c1_dispatch.run_effect(in_flight_effect)
+        finally:
+            finished.set()
+
+    _set_hook(binding)
+    monkeypatch.setattr("gateway.run_inbound_consumer.C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", 2)
+    runner = _runner()
+    try:
+        assert await runner._handle_message(_event()) is None
+        assert entered.is_set()
+        assert dispatches[0].readback() == "UNCERTAIN"
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+
+    assert dispatches[0].readback() == "UNCERTAIN"
+    await _runner()._handle_message(_event(update_id=999))
+    assert effects == ["started before timeout"]
+    assert len(dispatches) == 1
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_persists_uncertain_and_fences_the_released_callback():
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    effects, dispatches = [], []
+
+    def binding(*, c1_dispatch, **_kwargs):
+        dispatches.append(c1_dispatch)
+        entered.set()
+        try:
+            assert release.wait(10)
+            c1_dispatch.run_effect(effects.append, "too late")
+        finally:
+            finished.set()
+
+    _set_hook(binding)
+    runner = _runner()
+    task = asyncio.create_task(runner._handle_message(_event()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert dispatches[0].readback() == "UNCERTAIN"
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+
+    assert effects == []
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+def test_readback_does_not_create_a_ledger(tmp_path):
+    before = set(tmp_path.iterdir())
+    assert C1TelegramDispatch.read_request(tmp_path, "missing-request") is None
+    assert set(tmp_path.iterdir()) == before
+
+
+@pytest.mark.asyncio
+async def test_corrupt_ledger_blocks_dispatch_without_agent_fallback():
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "c1-telegram-dispatch.sqlite3"
+    path.write_bytes(b"not a sqlite database")
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    _set_hook(binding)
+    runner = _runner()
+
+    assert await runner._handle_message(_event()) is None
+
+    assert binding.calls == 0
+    assert gateway.sends == []
+    assert path.read_bytes() == b"not a sqlite database"
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_only_claims_one_dispatch():
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    effects, dispatches = [], []
+
+    def binding(*, c1_dispatch, **_kwargs):
+        dispatches.append(c1_dispatch)
+        entered.set()
+        try:
+            assert release.wait(10)
+            c1_dispatch.run_effect(effects.append, "once")
+        finally:
+            finished.set()
+
+    _set_hook(binding)
+    first = asyncio.create_task(_runner()._handle_message(_event()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert await _runner()._handle_message(_event(update_id=999)) is None
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        await first
+
+    assert effects == ["once"]
+    assert len(dispatches) == 1
+    assert dispatches[0].readback() == "EFFECT_FINISHED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_deferred_effect_is_rejected_before_its_body_can_run(wrapped):
+    effects, dispatches = [], []
+
+    async def deferred():
+        effects.append("must stay unexecuted")
+
+    def binding(*, c1_dispatch, **_kwargs):
+        dispatches.append(c1_dispatch)
+        effect = (lambda: deferred()) if wrapped else deferred
+        with pytest.raises(C1DispatchClosed):
+            c1_dispatch.run_effect(effect)
+
+    _set_hook(binding)
+
+    assert await _runner()._handle_message(_event()) is None
+
+    assert effects == []
+    assert dispatches[0].readback() == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
+async def test_binding_system_exit_is_contained_and_persisted_as_uncertain():
+    dispatches = []
+
+    def exits(*, c1_dispatch, **_kwargs):
+        dispatches.append(c1_dispatch)
+        raise SystemExit(1)
+
+    _set_hook(exits)
+    runner = _runner()
+
+    assert await runner._handle_message(_event()) is None
+
+    assert dispatches[0].readback() == "UNCERTAIN"
     runner._handle_message_with_agent.assert_not_awaited()

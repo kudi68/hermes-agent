@@ -10,6 +10,9 @@ Fail-open: a callback that raises, times out or returns anything other than
 ``{"action": "handled"}`` is logged/ignored and the message proceeds to the agent, so one buggy
 plugin can never blackhole a profile's traffic. The payload is a plain snapshot, never live
 runner/session-store handles.
+
+The fixed C1 request uses a separate fail-closed binding contract below: its
+payload also carries a durable, deadline-bound capability for one synchronous effect.
 """
 
 from __future__ import annotations
@@ -18,8 +21,12 @@ import asyncio
 import contextlib
 from datetime import UTC, datetime, timedelta
 import hashlib
+import inspect
 import json
 import logging
+from pathlib import Path
+import sqlite3
+import time
 from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -98,6 +105,144 @@ def is_c1_telegram_personal_target(event: Any, source: Any, runner: Any) -> bool
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+class C1DispatchClosed(RuntimeError):
+    """The request cannot authorize another effect; read back instead of retrying."""
+
+
+class C1TelegramDispatch:
+    """Durable, at-most-once effect gate for a cooperative C1 binding.
+
+    A binding must explicitly accept ``c1_dispatch`` and put *all* irreversible
+    work inside its single ``run_effect`` call. This is a trusted-plugin contract,
+    not a sandbox for arbitrary Python. An effect already started may have an
+    uncertain outcome; abandoning a thread never proves that effect was cancelled.
+    """
+
+    def __init__(self, runtime_home: Path, identity: dict):
+        self.path = Path(runtime_home) / "c1-telegram-dispatch.sqlite3"
+        self.request_id = identity["request_id"]
+        self.expires_at = datetime.fromisoformat(identity["expires_at"])
+        self.deadline = time.monotonic() + C1_TELEGRAM_HOOK_TIMEOUT_SECONDS
+        fingerprint = _canonical_digest(identity)
+        with self._connect() as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS requests ("
+                "request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+                "status TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            self.claimed = db.execute(
+                "INSERT OR IGNORE INTO requests VALUES (?, ?, 'DISPATCHING', ?)",
+                (self.request_id, fingerprint, _utc_now().isoformat()),
+            ).rowcount == 1
+            prior = db.execute(
+                "SELECT fingerprint FROM requests WHERE request_id = ?", (self.request_id,)
+            ).fetchone()
+            if prior[0] != fingerprint:
+                raise C1DispatchClosed("request identity conflict")
+
+    @contextlib.contextmanager
+    def _connect(self):
+        # Only hashes and terminal state are persisted, never Telegram account data or text.
+        with contextlib.closing(sqlite3.connect(self.path, timeout=1)) as db:
+            with db:
+                yield db
+
+    def readback(self) -> str:
+        return self.read_request(self.path.parent, self.request_id)["status"]
+
+    @staticmethod
+    def read_request(runtime_home: Path, request_id: str) -> dict | None:
+        """Read a request in a fresh process without creating or changing its ledger."""
+        path = Path(runtime_home) / "c1-telegram-dispatch.sqlite3"
+        if not path.is_file():
+            return None
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            row = db.execute(
+                "SELECT status, updated_at FROM requests WHERE request_id = ?", (request_id,)
+            ).fetchone()
+        return {"request_id": request_id, "status": row[0], "updated_at": row[1]} if row else None
+
+    def uncertain(self) -> None:
+        with self._connect() as db:
+            db.execute(
+                "UPDATE requests SET status = 'UNCERTAIN', updated_at = ? "
+                "WHERE request_id = ? AND status IN ('DISPATCHING', 'EFFECT_STARTED', 'EFFECT_FINISHED')",
+                (_utc_now().isoformat(), self.request_id),
+            )
+
+    def run_effect(self, effect, *args, **kwargs):
+        """Authorize one effect before its deadline; a late callback cannot reauthorize it."""
+        if not self.claimed:
+            raise C1DispatchClosed("replayed dispatch")
+        if inspect.iscoroutinefunction(effect):
+            self.uncertain()
+            raise C1DispatchClosed("effect must complete synchronously inside the gate")
+        if time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
+            self.uncertain()
+            raise C1DispatchClosed("dispatch deadline expired")
+        with self._connect() as db:
+            # BEGIN IMMEDIATE serializes timeout, replay and concurrent callback claims.
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                "UPDATE requests SET status = 'EFFECT_STARTED', updated_at = ? "
+                "WHERE request_id = ? AND status = 'DISPATCHING'",
+                (_utc_now().isoformat(), self.request_id),
+            ).rowcount
+        if not changed:
+            raise C1DispatchClosed("dispatch already claimed or uncertain")
+        try:
+            # Recheck after durable intent: acquiring the database may have used the budget.
+            if time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
+                raise C1DispatchClosed("effect deadline expired")
+            result = effect(*args, **kwargs)
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise C1DispatchClosed("effect returned deferred work")
+        except BaseException:
+            self.uncertain()
+            raise
+        with self._connect() as db:
+            # A late completion must never overwrite the timeout's UNCERTAIN state.
+            db.execute(
+                "UPDATE requests SET status = 'EFFECT_FINISHED', updated_at = ? "
+                "WHERE request_id = ? AND status = 'EFFECT_STARTED'",
+                (_utc_now().isoformat(), self.request_id),
+            )
+        return result
+
+
+def _c1_binding_callback():
+    from hermes_cli.plugins import has_hook, iter_hook_callbacks
+
+    if not has_hook(POST_ADMISSION_HOOK):
+        return None
+    callbacks = iter_hook_callbacks(POST_ADMISSION_HOOK)
+    if len(callbacks) != 1:
+        return None
+    callback = callbacks[0]
+    try:
+        parameter = inspect.signature(callback).parameters.get("c1_dispatch")
+    except (TypeError, ValueError):
+        return None
+    # **kwargs alone is not evidence that the binding implements the effect-gate contract.
+    if parameter is None or parameter.kind not in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY
+    ):
+        return None
+    return callback
+
+
+def _invoke_c1_binding(callback, payload):
+    from hermes_cli.plugins_dispatch import PluginDispatchMixin
+
+    try:
+        return PluginDispatchMixin._invoke_hook_callback(callback, payload)
+    except SystemExit as exc:
+        # Preserve the ordinary plugin dispatcher's isolation before reaching asyncio.
+        raise RuntimeError("C1 binding exited") from exc
 
 
 def _telegram_c1_identity(event: Any, source: Any) -> dict | None:
@@ -195,30 +340,49 @@ async def run_c1_telegram_personal(
         logger.warning("C1 Telegram request rejected before dispatch; consuming without agent fallback")
         return True, None
 
+    dispatch = None
     try:
         async with _routed_scope(runner, source):
-            from hermes_cli.lifecycle import has_hook, invoke_hook
-            if not has_hook(POST_ADMISSION_HOOK):
-                logger.error("C1 Telegram binding is unavailable; consuming without agent fallback")
+            from gateway.session_identity import canonical_identity
+            runtime_identity = canonical_identity(source, runner=runner)
+            dispatch = C1TelegramDispatch(runtime_identity.runtime_home, identity)
+            if not dispatch.claimed:
+                logger.warning("C1 Telegram request already recorded: %s", dispatch.readback())
+                return True, None
+            callback = _c1_binding_callback()
+            if callback is None:
+                dispatch.uncertain()
+                logger.error("C1 Telegram fenced binding is unavailable; consuming without agent fallback")
                 return True, None
             hook_source = source.to_dict()
             hook_source["c1_telegram_identity"] = identity
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    invoke_hook,
-                    POST_ADMISSION_HOOK,
-                    session_key=session_key,
-                    platform=platform,
-                    source=hook_source,
-                    message_id=event.message_id,
-                    text=C1_TELEGRAM_REQUEST,
-                    telegram_identity=identity,
+                    _invoke_c1_binding,
+                    callback,
+                    dict(
+                        session_key=session_key,
+                        platform=platform,
+                        source=hook_source,
+                        message_id=event.message_id,
+                        text=C1_TELEGRAM_REQUEST,
+                        telegram_identity=identity,
+                        c1_dispatch=dispatch,
+                    ),
                 ),
                 timeout=C1_TELEGRAM_HOOK_TIMEOUT_SECONDS,
             )
+            # EFFECT_FINISHED only records that the synchronous effect returned;
+            # delivery/receipt truth still belongs to the downstream C1 ledger.
+            if dispatch.readback() == "DISPATCHING":
+                dispatch.uncertain()
     except asyncio.CancelledError:
+        if dispatch is not None:
+            dispatch.uncertain()
         raise
     except Exception as exc:
+        if dispatch is not None:
+            dispatch.uncertain()
         logger.warning(
             "C1 Telegram binding failed (%s); consuming without agent fallback",
             type(exc).__name__,
