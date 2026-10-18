@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
@@ -26,6 +27,7 @@ import json
 import logging
 from pathlib import Path
 import sqlite3
+import threading
 import time
 from typing import Any, Optional, Tuple
 
@@ -116,14 +118,17 @@ class C1TelegramDispatch:
 
     A binding must explicitly accept ``c1_dispatch``. Check ``check_active`` before
     admitting durable C1 work, and use ``run_effect`` at the actual return-transport
-    boundary, after preparation. Never wrap a whole workflow or queue deferred
-    work inside the effect: that would authorize a later send too early.
+    boundary on the consumer event loop, after preparation. The synchronous
+    transport callable must not block that loop. Never wrap a whole workflow
+    or queue deferred work inside the effect: that would authorize a later send too early.
     This is a trusted-plugin contract, not a Python sandbox. An already-started
     transport operation may have an uncertain outcome; abandoning its thread
     never proves that operation was cancelled.
     """
 
     def __init__(self, runtime_home: Path, identity: dict):
+        self._effect_loop = asyncio.get_running_loop()
+        self._effect_thread = threading.get_ident()
         self.path = Path(runtime_home) / "c1-telegram-dispatch.sqlite3"
         self.request_id = identity["request_id"]
         self.expires_at = datetime.fromisoformat(identity["expires_at"])
@@ -167,7 +172,32 @@ class C1TelegramDispatch:
             ).fetchone()
         return {"request_id": request_id, "status": row[0], "updated_at": row[1]} if row else None
 
+    def _on_effect_loop(self, callback, *args, **kwargs):
+        if threading.get_ident() == self._effect_thread:
+            return callback(*args, **kwargs)
+        outcome = Future()
+
+        def invoke():
+            try:
+                outcome.set_result(callback(*args, **kwargs))
+            except BaseException as exc:
+                # SystemExit from a trusted binding must not terminate the loop.
+                logger.debug("C1 effect boundary rejected or failed", exc_info=True)
+                outcome.set_exception(exc)
+
+        # call_soon_threadsafe carries the binding's routed ContextVars with it.
+        self._effect_loop.call_soon_threadsafe(invoke)
+        return outcome.result()
+
     def uncertain(self) -> None:
+        # Timeout and transport entry share one serial owner, including failures
+        # reported by a worker. A stopped loop can no longer invoke a transport.
+        if self._effect_loop.is_closed():
+            self._mark_uncertain()
+        else:
+            self._on_effect_loop(self._mark_uncertain)
+
+    def _mark_uncertain(self) -> None:
         with self._connect() as db:
             db.execute(
                 "UPDATE requests SET status = 'UNCERTAIN', updated_at = ? "
@@ -205,7 +235,7 @@ class C1TelegramDispatch:
             # Recheck after durable intent: acquiring the database may have used the budget.
             if time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
                 raise C1DispatchClosed("effect deadline expired")
-            result = effect(*args, **kwargs)
+            result = self._on_effect_loop(self._invoke_effect, effect, *args, **kwargs)
             if inspect.isawaitable(result):
                 if inspect.iscoroutine(result):
                     result.close()
@@ -220,6 +250,24 @@ class C1TelegramDispatch:
                 "WHERE request_id = ? AND status = 'EFFECT_STARTED'",
                 (_utc_now().isoformat(), self.request_id),
             )
+        return result
+
+    def _invoke_effect(self, effect, *args, **kwargs):
+        # No await or worker hop between this check and the actual invocation:
+        # asyncio timeout/cancellation cannot close the dispatch in that gap.
+        # Preparation belongs on the binding worker, never in this callable.
+        if (
+            time.monotonic() >= self.deadline
+            or _utc_now() > self.expires_at
+            or self.readback() != "EFFECT_STARTED"
+        ):
+            raise C1DispatchClosed("transport boundary closed")
+        result = effect(*args, **kwargs)
+        # A synchronous transport may return after its budget, before the loop
+        # can process its timeout. Its receipt must not clear uncertainty.
+        if time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
+            self._mark_uncertain()
+            raise C1DispatchClosed("transport completed after deadline")
         return result
 
 

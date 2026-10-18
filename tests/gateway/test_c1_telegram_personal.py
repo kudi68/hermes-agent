@@ -704,6 +704,72 @@ async def test_timeout_fences_late_callback_side_effects(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("closure", ["timeout", "cancellation"])
+async def test_timeout_between_final_check_and_transport_call_cannot_send(monkeypatch, closure):
+    """F2 review probe: timeout wins after the worker's final clock check.
+
+    The clock seam holds a captured, valid timestamp after durable effect intent.
+    No source-line hook or replacement of the dispatch gate is involved.
+    """
+    checked, release, finished = threading.Event(), threading.Event(), threading.Event()
+    effects, dispatches, errors = [], [], []
+    worker = None
+
+    def clock():
+        if (
+            threading.get_ident() == worker
+            and dispatches
+            and dispatches[0].readback() == "EFFECT_STARTED"
+            and not checked.is_set()
+        ):
+            checked.set()
+            assert release.wait(10)
+        return TEST_NOW
+
+    def binding(*, c1_dispatch, **_kwargs):
+        nonlocal worker
+        worker = threading.get_ident()
+        dispatches.append(c1_dispatch)
+        try:
+            c1_dispatch.run_effect(effects.append, "send")
+        except C1DispatchClosed:
+            pass
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr("gateway.run_inbound_consumer._utc_now", clock)
+    monkeypatch.setattr("gateway.run_inbound_consumer.C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", 2)
+    _set_hook(binding)
+    runner = _runner()
+    task = asyncio.create_task(runner._handle_message(_event()))
+    try:
+        if closure == "cancellation":
+            assert await asyncio.to_thread(checked.wait, 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await task is None
+        assert checked.is_set(), "probe did not reach the final clock check"
+        dispatch = dispatches[0]
+        assert dispatch.readback() == "UNCERTAIN"
+        assert effects == []
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+
+    assert errors == []
+    assert effects == [], "transport was invoked after timeout was persisted"
+    assert C1TelegramDispatch.read_request(dispatch.path.parent, dispatch.request_id)["status"] == "UNCERTAIN"
+    await _runner()._handle_message(_event(update_id=999))
+    assert len(dispatches) == 1
+    assert effects == []
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["legacy", "ambiguous"])
 async def test_unfenced_or_ambiguous_binding_is_never_invoked(kind):
     effects = []
@@ -766,9 +832,15 @@ async def test_a_binding_cannot_authorize_a_second_effect():
 @pytest.mark.asyncio
 async def test_late_effect_completion_cannot_clear_uncertain_or_retry(monkeypatch):
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
-    effects, dispatches = [], []
+    effects, dispatches, errors = [], [], []
+    release_timer = None
 
     def in_flight_effect():
+        nonlocal release_timer
+        # The transport now enters on the timeout-owning loop. Model a remote
+        # completion independently of that loop, so the fake cannot deadlock it.
+        release_timer = threading.Timer(2, release.set)
+        release_timer.start()
         effects.append("started before timeout")
         entered.set()
         assert release.wait(10)
@@ -777,6 +849,10 @@ async def test_late_effect_completion_cannot_clear_uncertain_or_retry(monkeypatc
         dispatches.append(c1_dispatch)
         try:
             c1_dispatch.run_effect(in_flight_effect)
+        except C1DispatchClosed:
+            pass
+        except BaseException as exc:
+            errors.append(exc)
         finally:
             finished.set()
 
@@ -790,7 +866,11 @@ async def test_late_effect_completion_cannot_clear_uncertain_or_retry(monkeypatc
     finally:
         release.set()
         assert await asyncio.to_thread(finished.wait, 2)
+        if release_timer is not None:
+            release_timer.cancel()
+            release_timer.join(2)
 
+    assert errors == []
     assert dispatches[0].readback() == "UNCERTAIN"
     await _runner()._handle_message(_event(update_id=999))
     assert effects == ["started before timeout"]
