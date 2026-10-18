@@ -92,3 +92,35 @@ DB 持續等鎖可能使 UNCERTAIN 寫入失敗；程式不宣稱成功，記憶
 下一步：在此 frozen candidate 上做限定範圍 fresh review，尤其核對最終 durable read
 到 coroutine I/O 入口的契約；若需正式 binding，另定單次 attempt seam 的授權範圍。
 Human 現在無需操作；不把離線 PASS 當成解閘授權。
+
+## R4 修補與本輪續接（2026-10-18；取代上方歷史下一步）
+本輪唯一 checkout `/private/tmp/hermes-r4-fix-20261018`，detached 基線
+`b41385cd2df2de5b4a96217670876b808431a132`；只改 consumer、指定 test、本段。
+全域 nonblocking threading.Lock 准入最多 1 個 binding；忙碌的新請求直接 consume，
+真 SQLite intent 收為 UNCERTAIN 並記 rejected/UNCERTAIN，不排 binding、不 send；
+duplicate 保留既有 durable state。SQLite 初始化／check_active read／claim／readback／
+finish／取消收尾改用專屬 max_workers=2 executor，保留 contextvars；不擴大 default 池。
+wait_for shield 真 binding task；timeout／取消先 fence 並 durable UNCERTAIN，准入直到
+worker 真退出才釋放，晚 exception 有取回；其他 Gateway 路徑不變。
+正式測試以獨立子程序限時，觀察而不修改 default capacity；真 bridge／gate／SQLite／
+consumer 收尾保留。consumer 的 identity／callback／預初始化 factory 是離線 seam，
+不證明 production identity。飽和時驗有界結束、UNCERTAIN、零 send、無關 executor 恢復，
+及晚 worker 未退出時拒絕新請求、退出後恢復准入。直接 N-worker claim 探針用離線
+transport 在網路 send 前回報失敗；consumer 探針則證明 timeout／取消後不進 transport。
+VERIFIED RED：產品 bytes 為 b41385cd2df 時，consumer timeout／取消 2 failed，
+`/private/tmp/hermes-r4-red.log`；同步所有 bridge 後的真 claim 探針 1 failed，
+`/private/tmp/hermes-r4-red-dispatch.log`。`scripts/run_tests.sh -j 1 --file-retries 0
+ tests/gateway/test_c1_telegram_personal.py -k saturated_executor`（後者加 `and dispatch`）。
+失敗嘗試：沙箱 runner PermissionError、0 tests；經自動審查准許的離線執行才得證據。
+早期 direct 探針在 claim 前過期，第二次取消會放走 worker，基線 PASS；已改真 claim 路徑。
+Human 限制原話：「不准 push、merge、留言、改設定或讀金鑰。」；「上限 60 分鐘。」
+本段為唯一續接文件，PERSISTED／LOCAL_ONLY，未同步其他裝置；既有 dirty 保留。
+UNKNOWN／NOT_EXECUTED：production binding／SDK、admission／receipt、live、獨立審查；
+慢磁碟／SQLite 持續鎖不是 executor 飽和保證，仍可能使 durable 寫入失敗，不能宣稱 live PASS。
+VERIFIED GREEN：沿用上方七檔完整 runner 命令（HOME 改 `/private/tmp/hermes-r4-test-home`），
+含 3 個新回歸，71 passed／0 failed／16.5s／exit 0；完整輸出
+`/private/tmp/hermes-r4-green-final.log`。`/private/tmp/hermes-chief-c1-patch/.venv/bin/python
+ scripts/check --base b41385cd2df`：12 checks ok、0 blocking／0 advisory、exit 0，
+`/private/tmp/hermes-r4-check.log`；`git diff --check` exit 0。僅三個核准檔案變更。
+owner 本輪 Codex；本地 scoped commit 由此 checkout `git log -1` 取得；無 push／merge。
+唯一下一步：對此 frozen R4 candidate 做獨立離線驗收，需另行交辦授權；live 不在範圍內。

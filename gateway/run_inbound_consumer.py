@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
@@ -39,6 +42,26 @@ C1_TELEGRAM_HOOK_TIMEOUT_SECONDS = 45
 # Telegram timestamps have second precision; tolerate a small sender/host clock skew.
 C1_TELEGRAM_FUTURE_SKEW_SECONDS = 30
 _C1_TELEGRAM_IDENTITY_SCHEMA = "hermes-telegram-message-identity-v1"
+# Binding workers may synchronously wait on the owner loop. Their DB dependency
+# must never compete for those same default-executor workers.
+_C1_DB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="c1-sqlite")
+_C1_IN_FLIGHT = threading.Lock()
+
+
+async def _c1_db_work(function, *args):
+    context = contextvars.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(
+        _C1_DB_EXECUTOR, partial(context.run, function, *args),
+    )
+
+
+def _release_c1_binding(task):
+    # A timed-out worker can still be preparing. Keep admission closed until it
+    # actually exits, and retrieve its late exception without starting new work.
+    if not task.cancelled():
+        task.exception()
+    _C1_IN_FLIGHT.release()
+
 
 
 def _routed_scope(runner: Any, source: Any):
@@ -137,7 +160,7 @@ class C1TelegramDispatch:
     @classmethod
     async def create(cls, runtime_home: Path, identity: dict):
         dispatch = cls(runtime_home, identity)
-        await asyncio.to_thread(dispatch._initialize, identity)
+        await _c1_db_work(dispatch._initialize, identity)
         return dispatch
 
     def _initialize(self, identity):
@@ -200,7 +223,7 @@ class C1TelegramDispatch:
         active = self._effect_task
         if active is not None and active is not asyncio.current_task() and not active.done():
             active.cancel()
-        await asyncio.to_thread(self._mark_uncertain)
+        await _c1_db_work(self._mark_uncertain)
 
     def _mark_uncertain(self) -> None:
         with self._connect() as db:
@@ -218,7 +241,7 @@ class C1TelegramDispatch:
         """Worker-only admission check; recheck time AFTER the blocking read."""
         if threading.get_ident() == self._effect_thread:
             raise C1DispatchClosed("admission preparation belongs on a worker")
-        state = self.readback()
+        state = self._worker_bridge(_c1_db_work, self.readback)
         self._check_deadline()
         if not self.claimed or state != "DISPATCHING":
             raise C1DispatchClosed("dispatch already claimed or uncertain")
@@ -254,9 +277,9 @@ class C1TelegramDispatch:
                 self._check_deadline()
                 if not self.claimed or not inspect.iscoroutinefunction(effect):
                     raise C1DispatchClosed("transport must be an async single-attempt callable")
-                if not await asyncio.to_thread(self._claim_effect):
+                if not await _c1_db_work(self._claim_effect):
                     raise C1DispatchClosed("dispatch already claimed or uncertain")
-                state = await asyncio.to_thread(self.readback)
+                state = await _c1_db_work(self.readback)
                 # Same critical section, after ALL blocking I/O. No await between
                 # this final state/time check and entry into the transport body.
                 if state != "EFFECT_STARTED":
@@ -274,7 +297,7 @@ class C1TelegramDispatch:
                     if inspect.iscoroutine(result):
                         result.close()
                     raise C1DispatchClosed("transport returned deferred work")
-                await asyncio.to_thread(self._finish_effect)
+                await _c1_db_work(self._finish_effect)
                 self._check_deadline()
                 return result
         except SystemExit as exc:
@@ -411,14 +434,21 @@ async def run_c1_telegram_personal(
         logger.warning("C1 Telegram request rejected before dispatch; consuming without agent fallback")
         return True, None
 
+    admitted = _C1_IN_FLIGHT.acquire(blocking=False)
     dispatch = None
+    binding_task = None
     try:
         async with _routed_scope(runner, source):
             from gateway.session_identity import canonical_identity
             runtime_identity = canonical_identity(source, runner=runner)
             dispatch = await C1TelegramDispatch.create(runtime_identity.runtime_home, identity)
+            if not admitted:
+                if dispatch.claimed:
+                    await dispatch.aclose()
+                logger.warning("C1 Telegram request rejected/UNCERTAIN: busy; consumed without queue or send")
+                return True, None
             if not dispatch.claimed:
-                logger.warning("C1 Telegram request already recorded: %s", await asyncio.to_thread(dispatch.readback))
+                logger.warning("C1 Telegram request already recorded: %s", await _c1_db_work(dispatch.readback))
                 return True, None
             callback = _c1_binding_callback()
             if callback is None:
@@ -427,7 +457,7 @@ async def run_c1_telegram_personal(
                 return True, None
             hook_source = source.to_dict()
             hook_source["c1_telegram_identity"] = identity
-            await asyncio.wait_for(
+            binding_task = asyncio.create_task(
                 asyncio.to_thread(
                     _invoke_c1_binding,
                     callback,
@@ -441,11 +471,13 @@ async def run_c1_telegram_personal(
                         c1_dispatch=dispatch,
                     ),
                 ),
-                timeout=C1_TELEGRAM_HOOK_TIMEOUT_SECONDS,
+            )
+            await asyncio.wait_for(
+                asyncio.shield(binding_task), timeout=C1_TELEGRAM_HOOK_TIMEOUT_SECONDS,
             )
             # EFFECT_FINISHED only records that the async transport returned;
             # delivery/receipt truth still belongs to the downstream C1 ledger.
-            if await asyncio.to_thread(dispatch.readback) == "DISPATCHING":
+            if await _c1_db_work(dispatch.readback) == "DISPATCHING":
                 await dispatch.aclose()
     except asyncio.CancelledError:
         if dispatch is not None:
@@ -458,6 +490,15 @@ async def run_c1_telegram_personal(
             "C1 Telegram binding failed (%s); consuming without agent fallback",
             type(exc).__name__,
         )
+    finally:
+        if admitted:
+            if binding_task is not None:
+                if binding_task.done():
+                    _release_c1_binding(binding_task)
+                else:
+                    binding_task.add_done_callback(_release_c1_binding)
+            else:
+                _C1_IN_FLIGHT.release()
     # The binding sends through its receipt-aware Gateway transport. Returning a
     # reply here would cause Hermes to send a second, unreceipted message.
     return True, None

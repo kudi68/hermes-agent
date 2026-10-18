@@ -1260,3 +1260,139 @@ async def test_async_transport_system_exit_is_contained(tmp_path):
     with pytest.raises(RuntimeError, match="transport exited"):
         await dispatch.arun_effect(transport)
     assert await asyncio.to_thread(dispatch.readback) == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["dispatch", "timeout", "cancellation"])
+async def test_saturated_executor_closes_uncertain_without_send(tmp_path, mode):
+    """R4: real bridge/SQLite/cleanup in a bounded child; no production identity proof."""
+    import os
+    import subprocess
+    import sys
+
+    script = '''
+import asyncio, sys, threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from gateway import run_inbound_consumer as m
+from tests.waiting import async_wait_until
+
+async def main():
+    root, mode = Path(sys.argv[1]), sys.argv[2]
+    loop = asyncio.get_running_loop()
+    m.C1_TELEGRAM_HOOK_TIMEOUT_SECONDS = 2
+    expiry = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    # Observe the host default capacity without resizing it.
+    await asyncio.to_thread(lambda: None)
+    n = loop._default_executor._max_workers
+    sends = []
+    async def send():
+        if mode == 'dispatch':
+            raise TimeoutError('offline transport refused before network send')
+        sends.append('forbidden')
+    if mode == 'dispatch':
+        ds = [await m.C1TelegramDispatch.create(root, dict(
+            request_id=str(i), expires_at=expiry)) for i in range(n)]
+        barrier = threading.Barrier(n)
+        # Hold the real gates until every worker has entered the bridge.
+        for d in ds:
+            await d._gate.acquire()
+        def binding(d):
+            barrier.wait(timeout=4)
+            return d.run_effect(send)
+        async def invoke(d):
+            try:
+                await asyncio.wait_for(asyncio.to_thread(binding, d), 2)
+            except BaseException:
+                await d.aclose()
+        tasks = [asyncio.create_task(invoke(d)) for d in ds]
+        await async_wait_until(lambda: sum(
+            t.get_coro().__qualname__ == 'C1TelegramDispatch.arun_effect'
+            for t in asyncio.all_tasks()) == n, timeout=3,
+            what='all default workers waiting on their real dispatch bridge')
+        # All workers now wait on the owner loop, which must execute real claims.
+        for d in ds:
+            d._gate.release()
+        await asyncio.wait_for(asyncio.gather(*tasks), 6)
+    else:
+        ds = [await m.C1TelegramDispatch.create(root, dict(
+            request_id=str(i), expires_at=expiry)) for i in range(n+2)]
+        entered, release, worker_done = asyncio.Event(), threading.Event(), asyncio.Event()
+        invoked = []
+        def binding(**payload):
+            invoked.append(payload['c1_dispatch'].request_id)
+            if payload['c1_dispatch'].request_id != '0':
+                return {'action': 'handled'}
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                release.wait(6)
+                return payload['c1_dispatch'].run_effect(send)
+            finally:
+                loop.call_soon_threadsafe(worker_done.set)
+        # Match the review's controlled consumer seams; gate/DB/bridge remain real.
+        m.is_c1_telegram_personal_target = lambda *args: True
+        m._telegram_c1_identity = lambda event, source: dict(request_id=event.message_id)
+        m._c1_binding_callback = lambda: binding
+        sys.modules['gateway.session_identity'] = SimpleNamespace(
+            canonical_identity=lambda *args, **kwargs: SimpleNamespace(runtime_home=root))
+        async def factory(cls, home, identity):
+            return ds[int(identity['request_id'])]
+        m.C1TelegramDispatch.create = classmethod(factory)
+        source = SimpleNamespace(platform=SimpleNamespace(value='telegram'), to_dict=lambda: {})
+        async def consume(i):
+            return await m.run_c1_telegram_personal(
+                SimpleNamespace(), SimpleNamespace(message_id=str(i)), source, 'session')
+        first = asyncio.create_task(consume(0))
+        await asyncio.wait_for(entered.wait(), 3)
+        # Occupy the remaining default workers with unrelated work, as on a busy host.
+        all_busy = asyncio.Event()
+        barrier = threading.Barrier(n-1, action=lambda: loop.call_soon_threadsafe(all_busy.set))
+        free = threading.Event()
+        def unrelated():
+            barrier.wait(timeout=4)
+            free.wait(6)
+        blockers = [asyncio.create_task(asyncio.to_thread(unrelated)) for _ in range(n-1)]
+        await asyncio.wait_for(all_busy.wait(), 3)
+        try:
+            rejected = await asyncio.wait_for(asyncio.gather(
+                *(consume(i) for i in range(1, n))), 3)
+            assert rejected == [(True, None)] * (n-1), rejected
+            if mode == 'cancellation':
+                first.cancel()
+                try:
+                    await asyncio.wait_for(first, 3)
+                except asyncio.CancelledError:
+                    pass
+                else:
+                    raise AssertionError('consumer cancellation lost')
+            else:
+                assert await asyncio.wait_for(first, 4) == (True, None)
+            # Timed-out preparation is still in flight: do not admit its follower.
+            assert await asyncio.wait_for(consume(n), 3) == (True, None)
+            assert invoked == ['0'], invoked
+            assert [d.readback() for d in ds[:-1]] == ['UNCERTAIN'] * (n+1)
+        finally:
+            release.set()
+            free.set()
+        await asyncio.wait_for(worker_done.wait(), 3)
+        await asyncio.wait_for(asyncio.gather(*blockers), 3)
+        await async_wait_until(lambda: not m._C1_IN_FLIGHT.locked(), timeout=3)
+        assert await asyncio.wait_for(consume(n+1), 3) == (True, None)
+        assert invoked == ['0', str(n+1)], invoked
+    assert all(d.readback() == 'UNCERTAIN' for d in ds)
+    assert sends == [], sends
+    assert await asyncio.wait_for(asyncio.to_thread(lambda: 'recovered'), 3) == 'recovered'
+    print('BOUNDED UNCERTAIN NO_SEND EXECUTOR_RECOVERED', n, mode, flush=True)
+asyncio.run(main())
+'''
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run, [sys.executable, "-B", "-c", script, str(tmp_path), mode],
+            capture_output=True, text=True, timeout=16,
+            env={"PATH": os.defpath, "HOME": str(tmp_path)},
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("R4 shared executor circular wait; bounded child killed after 16s")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "BOUNDED UNCERTAIN NO_SEND EXECUTOR_RECOVERED" in result.stdout
