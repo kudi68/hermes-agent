@@ -5,6 +5,7 @@ hook error, expired input and timeout effects. All ingress uses the real runner.
 """
 
 import asyncio
+from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -29,6 +30,10 @@ from gateway.session import SessionSource
 TEST_KEY = b"MODELLED-only-telegram-c1-test-key-32-bytes"
 OWNER_TELEGRAM_USER_ID = "424242"
 TEST_NOW = datetime(2026, 10, 15, 10, 0, tzinfo=UTC)
+
+
+async def _append_effect(effects, value):
+    effects.append(value)
 
 
 def _canonical(value):
@@ -57,7 +62,7 @@ class FakeGatewayPort:
         self.uncertain = uncertain
         self.sends = []
 
-    def send_result(self, *, conversation_id, chat_id, thread_id, request_id, text):
+    async def send_result(self, *, conversation_id, chat_id, thread_id, request_id, text):
         attempt = {
             "conversation_id": conversation_id,
             "chat_id": chat_id,
@@ -708,38 +713,32 @@ async def test_timeout_fences_late_callback_side_effects(monkeypatch):
 async def test_timeout_between_final_check_and_transport_call_cannot_send(monkeypatch, closure):
     """F2 review probe: timeout wins after the worker's final clock check.
 
-    The clock seam holds a captured, valid timestamp after durable effect intent.
-    No source-line hook or replacement of the dispatch gate is involved.
+    The readback seam holds the real durable state after intent commit.
+    No clock jump, source-line hook or replacement of the gate is involved.
     """
     checked, release, finished = threading.Event(), threading.Event(), threading.Event()
     effects, dispatches, errors = [], [], []
-    worker = None
+    original_readback = C1TelegramDispatch.readback
 
-    def clock():
-        if (
-            threading.get_ident() == worker
-            and dispatches
-            and dispatches[0].readback() == "EFFECT_STARTED"
-            and not checked.is_set()
-        ):
+    def held_readback(dispatch):
+        state = original_readback(dispatch)
+        if state == "EFFECT_STARTED" and not checked.is_set():
             checked.set()
             assert release.wait(10)
-        return TEST_NOW
+        return state
 
     def binding(*, c1_dispatch, **_kwargs):
-        nonlocal worker
-        worker = threading.get_ident()
         dispatches.append(c1_dispatch)
         try:
-            c1_dispatch.run_effect(effects.append, "send")
-        except C1DispatchClosed:
+            c1_dispatch.run_effect(_append_effect, effects, "send")
+        except (C1DispatchClosed, FutureCancelledError, TimeoutError):
             pass
         except BaseException as exc:
             errors.append(exc)
         finally:
             finished.set()
 
-    monkeypatch.setattr("gateway.run_inbound_consumer._utc_now", clock)
+    monkeypatch.setattr(C1TelegramDispatch, "readback", held_readback)
     monkeypatch.setattr("gateway.run_inbound_consumer.C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", 2)
     _set_hook(binding)
     runner = _runner()
@@ -778,7 +777,7 @@ async def test_unfenced_or_ambiguous_binding_is_never_invoked(kind):
         effects.append("unfenced")
 
     def fenced(*, c1_dispatch, **_kwargs):
-        c1_dispatch.run_effect(effects.append, "fenced")
+        c1_dispatch.run_effect(_append_effect, effects, "fenced")
 
     manager = _set_hook(legacy if kind == "legacy" else fenced)
     if kind == "ambiguous":
@@ -800,7 +799,7 @@ async def test_callback_cannot_start_an_effect_after_message_expiry(monkeypatch)
         monkeypatch.setattr(
             "gateway.run_inbound_consumer._utc_now", lambda: TEST_NOW + timedelta(minutes=6)
         )
-        c1_dispatch.run_effect(effects.append, "expired")
+        c1_dispatch.run_effect(_append_effect, effects, "expired")
 
     _set_hook(expired_preparation)
     runner = _runner()
@@ -818,8 +817,8 @@ async def test_a_binding_cannot_authorize_a_second_effect():
 
     def twice(*, c1_dispatch, **_kwargs):
         dispatches.append(c1_dispatch)
-        c1_dispatch.run_effect(effects.append, "first")
-        c1_dispatch.run_effect(effects.append, "second")
+        c1_dispatch.run_effect(_append_effect, effects, "first")
+        c1_dispatch.run_effect(_append_effect, effects, "second")
 
     _set_hook(twice)
 
@@ -835,21 +834,20 @@ async def test_late_effect_completion_cannot_clear_uncertain_or_retry(monkeypatc
     effects, dispatches, errors = [], [], []
     release_timer = None
 
-    def in_flight_effect():
+    async def in_flight_effect():
         nonlocal release_timer
-        # The transport now enters on the timeout-owning loop. Model a remote
-        # completion independently of that loop, so the fake cannot deadlock it.
+        # Remote completion is independent; the async transport leaves the loop free.
         release_timer = threading.Timer(2, release.set)
         release_timer.start()
         effects.append("started before timeout")
         entered.set()
-        assert release.wait(10)
+        assert await asyncio.to_thread(release.wait, 10)
 
     def binding(*, c1_dispatch, **_kwargs):
         dispatches.append(c1_dispatch)
         try:
             c1_dispatch.run_effect(in_flight_effect)
-        except C1DispatchClosed:
+        except (C1DispatchClosed, FutureCancelledError, TimeoutError):
             pass
         except BaseException as exc:
             errors.append(exc)
@@ -888,7 +886,7 @@ async def test_cancellation_persists_uncertain_and_fences_the_released_callback(
         entered.set()
         try:
             assert release.wait(10)
-            c1_dispatch.run_effect(effects.append, "too late")
+            c1_dispatch.run_effect(_append_effect, effects, "too late")
         finally:
             finished.set()
 
@@ -945,7 +943,7 @@ async def test_concurrent_duplicate_only_claims_one_dispatch():
         entered.set()
         try:
             assert release.wait(10)
-            c1_dispatch.run_effect(effects.append, "once")
+            c1_dispatch.run_effect(_append_effect, effects, "once")
         finally:
             finished.set()
 
@@ -966,7 +964,7 @@ async def test_concurrent_duplicate_only_claims_one_dispatch():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wrapped", [False, True])
-async def test_deferred_effect_is_rejected_before_its_body_can_run(wrapped):
+async def test_sync_or_deferred_effect_is_rejected_before_its_body_can_run(wrapped):
     effects, dispatches = [], []
 
     async def deferred():
@@ -974,7 +972,7 @@ async def test_deferred_effect_is_rejected_before_its_body_can_run(wrapped):
 
     def binding(*, c1_dispatch, **_kwargs):
         dispatches.append(c1_dispatch)
-        effect = (lambda: deferred()) if wrapped else deferred
+        effect = (lambda: deferred()) if wrapped else (lambda: effects.append("sync forbidden"))
         with pytest.raises(C1DispatchClosed):
             c1_dispatch.run_effect(effect)
 
@@ -1040,3 +1038,225 @@ async def test_preparation_that_outlives_timeout_cannot_send_its_late_result(mon
     assert c1.records[binding.identities[0]["request_id"]].status == "RETURN_UNCERTAIN"
     assert dispatches[0].readback() == "UNCERTAIN"
     runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_lock_cannot_turn_final_read_into_a_late_send(tmp_path, monkeypatch):
+    """Real R1 lock contention, clocks and readback; no replaced gate."""
+    import sqlite3
+    import time
+    from gateway import run_inbound_consumer as consumer
+
+    monkeypatch.setattr(consumer, "C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", .1)
+    dispatch = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "sqlite-r1", "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    held, release = threading.Event(), threading.Event()
+    effects, errors = [], []
+    original = dispatch.readback
+    triggered = False
+
+    def locker():
+        try:
+            with sqlite3.connect(dispatch.path) as db:
+                db.execute("BEGIN EXCLUSIVE")
+                held.set()
+                assert release.wait(3)
+                db.rollback()
+        except BaseException as exc:
+            errors.append(exc)
+            held.set()
+
+    lock_thread = None
+
+    def contended_read():
+        nonlocal triggered, lock_thread
+        state = original()
+        if state == "EFFECT_STARTED" and not triggered:
+            triggered = True
+            lock_thread = threading.Thread(target=locker)
+            lock_thread.start()
+            assert held.wait(2)
+            state = original()
+        return state
+
+    monkeypatch.setattr(dispatch, "readback", contended_read)
+    loop = asyncio.get_running_loop()
+    heartbeat = asyncio.Event()
+    def beat():
+        heartbeat.set()
+        release.set()
+    loop.call_later(.3, beat)
+    fallback = threading.Timer(.8, release.set)
+    fallback.start()
+    started = time.monotonic()
+    def effect():
+        effects.append(time.monotonic() - started)
+    async def async_effect():
+        effect()
+        return {"receipt_ref": "offline"}
+    try:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(dispatch.run_effect, async_effect), 3)
+        except (C1DispatchClosed, TimeoutError):
+            pass
+    finally:
+        release.set()
+        fallback.cancel()
+        fallback.join(2)
+        if lock_thread is not None:
+            await asyncio.to_thread(lock_thread.join, 2)
+    assert errors == []
+    assert triggered
+    assert effects == [], f"send began after deadline: {effects}"
+    assert heartbeat.is_set()
+    assert original() == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
+async def test_slow_sync_transport_does_not_freeze_consumer_loop(tmp_path):
+    dispatch = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "slow-r1", "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    release = threading.Event()
+    heartbeat = asyncio.Event()
+    sends = []
+    def blocking():
+        sends.append("sync body ran")
+        assert release.wait(3)
+    def beat():
+        heartbeat.set()
+        release.set()
+    asyncio.get_running_loop().call_later(.1, beat)
+    fallback = threading.Timer(.5, release.set)
+    fallback.start()
+    try:
+        with pytest.raises(C1DispatchClosed):
+            await asyncio.wait_for(asyncio.to_thread(dispatch.run_effect, blocking), 3)
+    finally:
+        release.set()
+        fallback.cancel()
+        fallback.join(2)
+    assert sends == []
+    await asyncio.wait_for(heartbeat.wait(), 2)
+
+
+@pytest.mark.asyncio
+async def test_same_loop_result_shim_is_rejected_without_deadlock(tmp_path):
+    """A subprocess bounds the original uninterruptible owner-loop deadlock."""
+    import os
+    import subprocess
+    import sys
+    script = '''
+import asyncio
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from gateway.run_inbound_consumer import C1TelegramDispatch, C1DispatchClosed
+async def main():
+    loop = asyncio.get_running_loop()
+    d = await C1TelegramDispatch.create(Path(__import__('sys').argv[1]), dict(
+        request_id='deadlock', expires_at=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()))
+    async def send():
+        raise AssertionError('shim must never schedule send')
+    def shim():
+        asyncio.run_coroutine_threadsafe(send(), loop).result()
+    try:
+        await asyncio.to_thread(d.run_effect, shim)
+    except C1DispatchClosed:
+        print('REJECTED', flush=True)
+    else:
+        raise AssertionError('unsafe shim accepted')
+asyncio.run(main())
+'''
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run, [sys.executable, "-B", "-c", script, str(tmp_path)],
+            capture_output=True, text=True, timeout=4, env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("same-loop .result() deadlocked; isolated child killed after 4s")
+    assert result.returncode == 0, result.stderr
+    assert "REJECTED" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_owner_loop_bridge_rejects_before_scheduling_transport(tmp_path):
+    dispatch = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "owner-loop", "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    sends = []
+    with pytest.raises(C1DispatchClosed, match="async dispatch API"):
+        dispatch.run_effect(_append_effect, sends, "forbidden")
+    assert sends == []
+    # Correct async entry stays usable; rejecting bridge misuse schedules nothing.
+    await dispatch.arun_effect(_append_effect, sends, "once")
+    assert sends == ["once"]
+    assert await asyncio.to_thread(dispatch.readback) == "EFFECT_FINISHED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("swallow_cancel", [False, True])
+async def test_async_io_keeps_heartbeat_and_late_receipt_uncertain(tmp_path, swallow_cancel):
+    dispatch = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "async-slow", "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    entered, heartbeat, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    sends = []
+    async def transport():
+        sends.append("started")
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            if not swallow_cancel:
+                raise
+            return {"receipt_ref": "late-receipt-does-not-prove-delivery"}
+    task = asyncio.create_task(dispatch.arun_effect(transport))
+    await asyncio.wait_for(entered.wait(), 2)
+    # This callback must run while I/O is still pending, not after a Timer frees it.
+    asyncio.get_running_loop().call_soon(heartbeat.set)
+    await asyncio.wait_for(heartbeat.wait(), 2)
+    assert not task.done()
+    await dispatch.aclose()
+    with pytest.raises((asyncio.CancelledError, C1DispatchClosed)):
+        await task
+    assert cancelled.is_set()
+    assert await asyncio.to_thread(dispatch.readback) == "UNCERTAIN"
+    replay = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "async-slow", "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    with pytest.raises(C1DispatchClosed):
+        await replay.arun_effect(_append_effect, sends, "retry forbidden")
+    assert sends == ["started"]
+
+
+@pytest.mark.asyncio
+async def test_async_transport_timeout_cancels_io_and_persists_uncertain(tmp_path, monkeypatch):
+    from gateway import run_inbound_consumer as consumer
+    monkeypatch.setattr(consumer, "C1_TELEGRAM_HOOK_TIMEOUT_SECONDS", .1)
+    dispatch = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "io-timeout", "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    cancelled = asyncio.Event()
+    async def transport():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(dispatch.arun_effect(transport), 3)
+    assert cancelled.is_set()
+    assert await asyncio.to_thread(dispatch.readback) == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
+async def test_async_transport_system_exit_is_contained(tmp_path):
+    dispatch = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "transport-exit", "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    async def transport():
+        raise SystemExit(1)
+    with pytest.raises(RuntimeError, match="transport exited"):
+        await dispatch.arun_effect(transport)
+    assert await asyncio.to_thread(dispatch.readback) == "UNCERTAIN"

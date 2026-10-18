@@ -24,3 +24,26 @@
 - 在既有 bot 的 Owner 私人對話，只送一次：`回傳 kudi68/personal-ai-os 的 NEXT.md 第一行`。保存回覆所屬的同一 `request_id`，並在 fresh session 對 durable C1 store 做 readback；只核對 receipt 狀態、conversation target 與 request identity，不保存私人回覆內容。
 - 無回覆、逾時或 `RETURN_UNCERTAIN` 時**不重送**；先以同一 `request_id` 做 readback。現有 fixture CLI 不是 production ingress/readback 證據，部署前須確認正式 readback 工具與 store 路徑。
 - 回退：先保持／恢復 fail-closed 閘門，停止新 binding；還原部署前 Hermes 版本與程式，移除本次新增的 HMAC secret（若已安裝），保留既有 Telegram bot token 與 allowlist；再 graceful restart 原 serving Gateway，確認狀態正常且 C1 未執行。
+
+## F2 async transport binding 契約（第二輪；部署前必讀）
+
+本段取代舊同步 effect 假設；上方 `0dc24c...` pin 為歷史版本，不含 F2 第二輪，
+不可依該 pin 部署。新候選以 F2-DESIGN.md 的基線／本輪本機 commit 與實際 tree
+比對為準；正式 binding／獨立審查／production admission 仍未證明，維持不部署。
+
+- consumer 使用 `await C1TelegramDispatch.create(...)`，SQLite 初始化／claim／readback／
+  terminal state 都移到 worker；最後 durable read 回來後，在同一 owner-loop 臨界區
+  重查 closed、monotonic deadline、message expiry，才開始單次 async I/O。
+- binding 必須明列 `c1_dispatch`。準備／principal 驗證／阻塞 I/O 留 worker；admission 前
+  `check_active()`；worker 最後 `run_effect(async_send_once, ...)`，owner loop 則
+  `await arun_effect(async_send_once, ...)`。owner loop 禁止 `.result()`；同步 callable
+  在 body 執行前拒絕。不可用 lambda 回傳 coroutine、create_task、queue、同步 HTTP shim。
+- `async_send_once` 必須立即 await 一次真正的 Bot API I/O，且遵守取消。chat lock／pacing／
+  格式化在 gate 前完成。現有 Telegram `adapter.send()` 內含 lock／pacing／chunk／retry，
+  不能直接傳入。正式 binding 必須取得準備後的單次 attempt seam，並另作驗證。
+- 同一 dispatch 不自動 retry／chunk；這份修補未授權修改 Telegram adapter。多次 I/O
+  不可沿用一次 gate；若無單次 attempt seam，保持 fail-closed，不以 shim 解閘。
+- timeout／取消先關閉記憶體 gate，再 durable UNCERTAIN 並取消在途 coroutine。
+  取消等待不代表 Telegram 沒收到；晚 receipt 不清除 UNCERTAIN，restart 不重送。
+  DB 寫入失敗不得宣稱 UNCERTAIN 已持久化；既有 intent 仍須阻止 replay，人工 readback。
+- 離線鎖競爭／慢 I/O／同 loop 死鎖測試通過不等於真 Telegram binding 或 live delivery PASS。

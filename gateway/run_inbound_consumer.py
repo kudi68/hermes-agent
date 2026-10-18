@@ -12,14 +12,13 @@ plugin can never blackhole a profile's traffic. The payload is a plain snapshot,
 runner/session-store handles.
 
 The fixed C1 request uses a separate fail-closed binding contract below: its
-payload also carries a durable, deadline-bound capability for one synchronous effect.
+payload also carries a durable, deadline-bound capability for one asynchronous transport attempt.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
@@ -114,25 +113,34 @@ class C1DispatchClosed(RuntimeError):
 
 
 class C1TelegramDispatch:
-    """Durable, at-most-once effect gate for a cooperative C1 binding.
+    """One-shot async I/O gate for a cooperative, trusted C1 binding.
 
-    A binding must explicitly accept ``c1_dispatch``. Check ``check_active`` before
-    admitting durable C1 work, and use ``run_effect`` at the actual return-transport
-    boundary on the consumer event loop, after preparation. The synchronous
-    transport callable must not block that loop. Never wrap a whole workflow
-    or queue deferred work inside the effect: that would authorize a later send too early.
-    This is a trusted-plugin contract, not a Python sandbox. An already-started
-    transport operation may have an uncertain outcome; abandoning its thread
-    never proves that operation was cancelled.
+    Use ``await create(...)`` on the consumer loop. Prepare/validate in the
+    binding worker, then call ``run_effect`` there, or await ``arun_effect`` on
+    the owner loop. The async callable must start one API attempt immediately:
+    no chat-lock wait, pacing, retry, task creation or blocking I/O in its body.
+    Cancellation cannot prove that Telegram did not receive an in-flight send.
     """
 
     def __init__(self, runtime_home: Path, identity: dict):
         self._effect_loop = asyncio.get_running_loop()
         self._effect_thread = threading.get_ident()
+        self._gate = asyncio.Lock()
+        self._closed = False
+        self._effect_task = None
         self.path = Path(runtime_home) / "c1-telegram-dispatch.sqlite3"
         self.request_id = identity["request_id"]
         self.expires_at = datetime.fromisoformat(identity["expires_at"])
         self.deadline = time.monotonic() + C1_TELEGRAM_HOOK_TIMEOUT_SECONDS
+        self.claimed = False
+
+    @classmethod
+    async def create(cls, runtime_home: Path, identity: dict):
+        dispatch = cls(runtime_home, identity)
+        await asyncio.to_thread(dispatch._initialize, identity)
+        return dispatch
+
+    def _initialize(self, identity):
         fingerprint = _canonical_digest(identity)
         with self._connect() as db:
             db.execute(
@@ -172,30 +180,27 @@ class C1TelegramDispatch:
             ).fetchone()
         return {"request_id": request_id, "status": row[0], "updated_at": row[1]} if row else None
 
-    def _on_effect_loop(self, callback, *args, **kwargs):
+    def _worker_bridge(self, async_method, *args, **kwargs):
+        # Reject BEFORE constructing/scheduling a coroutine on its own loop.
         if threading.get_ident() == self._effect_thread:
-            return callback(*args, **kwargs)
-        outcome = Future()
-
-        def invoke():
-            try:
-                outcome.set_result(callback(*args, **kwargs))
-            except BaseException as exc:
-                # SystemExit from a trusted binding must not terminate the loop.
-                logger.debug("C1 effect boundary rejected or failed", exc_info=True)
-                outcome.set_exception(exc)
-
-        # call_soon_threadsafe carries the binding's routed ContextVars with it.
-        self._effect_loop.call_soon_threadsafe(invoke)
-        return outcome.result()
+            raise C1DispatchClosed("use the async dispatch API on the owner loop")
+        if self._effect_loop.is_closed():
+            raise C1DispatchClosed("dispatch loop closed")
+        return asyncio.run_coroutine_threadsafe(
+            async_method(*args, **kwargs), self._effect_loop,
+        ).result()
 
     def uncertain(self) -> None:
-        # Timeout and transport entry share one serial owner, including failures
-        # reported by a worker. A stopped loop can no longer invoke a transport.
-        if self._effect_loop.is_closed():
-            self._mark_uncertain()
-        else:
-            self._on_effect_loop(self._mark_uncertain)
+        self._worker_bridge(self.aclose)
+
+    async def aclose(self) -> None:
+        # Close immediately, before any DB wait or effect lock. A read already
+        # running on a worker cannot reopen this owner-loop fence when it returns.
+        self._closed = True
+        active = self._effect_task
+        if active is not None and active is not asyncio.current_task() and not active.done():
+            active.cancel()
+        await asyncio.to_thread(self._mark_uncertain)
 
     def _mark_uncertain(self) -> None:
         with self._connect() as db:
@@ -205,70 +210,79 @@ class C1TelegramDispatch:
                 (_utc_now().isoformat(), self.request_id),
             )
 
+    def _check_deadline(self):
+        if self._closed or time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
+            raise C1DispatchClosed("dispatch deadline expired or closed")
+
     def check_active(self) -> None:
-        """Reject late preparation before it admits durable work or claims the return."""
-        if not self.claimed:
-            raise C1DispatchClosed("replayed dispatch")
-        if time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
-            self.uncertain()
-            raise C1DispatchClosed("dispatch deadline expired")
-        if self.readback() != "DISPATCHING":
+        """Worker-only admission check; recheck time AFTER the blocking read."""
+        if threading.get_ident() == self._effect_thread:
+            raise C1DispatchClosed("admission preparation belongs on a worker")
+        state = self.readback()
+        self._check_deadline()
+        if not self.claimed or state != "DISPATCHING":
             raise C1DispatchClosed("dispatch already claimed or uncertain")
 
     def run_effect(self, effect, *args, **kwargs):
-        """Authorize one immediate transport operation; late callbacks cannot claim it."""
-        self.check_active()
-        if inspect.iscoroutinefunction(effect):
-            self.uncertain()
-            raise C1DispatchClosed("effect must complete synchronously inside the gate")
+        """Worker bridge to the async single-attempt transport boundary."""
+        return self._worker_bridge(self.arun_effect, effect, *args, **kwargs)
+
+    def _claim_effect(self):
         with self._connect() as db:
-            # BEGIN IMMEDIATE serializes timeout, replay and concurrent callback claims.
             db.execute("BEGIN IMMEDIATE")
-            changed = db.execute(
+            return db.execute(
                 "UPDATE requests SET status = 'EFFECT_STARTED', updated_at = ? "
                 "WHERE request_id = ? AND status = 'DISPATCHING'",
                 (_utc_now().isoformat(), self.request_id),
-            ).rowcount
-        if not changed:
-            raise C1DispatchClosed("dispatch already claimed or uncertain")
-        try:
-            # Recheck after durable intent: acquiring the database may have used the budget.
-            if time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
-                raise C1DispatchClosed("effect deadline expired")
-            result = self._on_effect_loop(self._invoke_effect, effect, *args, **kwargs)
-            if inspect.isawaitable(result):
-                if inspect.iscoroutine(result):
-                    result.close()
-                raise C1DispatchClosed("effect returned deferred work")
-        except BaseException:
-            self.uncertain()
-            raise
+            ).rowcount == 1
+
+    def _finish_effect(self):
         with self._connect() as db:
-            # A late completion must never overwrite the timeout's UNCERTAIN state.
             db.execute(
                 "UPDATE requests SET status = 'EFFECT_FINISHED', updated_at = ? "
                 "WHERE request_id = ? AND status = 'EFFECT_STARTED'",
                 (_utc_now().isoformat(), self.request_id),
             )
-        return result
 
-    def _invoke_effect(self, effect, *args, **kwargs):
-        # No await or worker hop between this check and the actual invocation:
-        # asyncio timeout/cancellation cannot close the dispatch in that gap.
-        # Preparation belongs on the binding worker, never in this callable.
-        if (
-            time.monotonic() >= self.deadline
-            or _utc_now() > self.expires_at
-            or self.readback() != "EFFECT_STARTED"
-        ):
-            raise C1DispatchClosed("transport boundary closed")
-        result = effect(*args, **kwargs)
-        # A synchronous transport may return after its budget, before the loop
-        # can process its timeout. Its receipt must not clear uncertainty.
-        if time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
-            self._mark_uncertain()
-            raise C1DispatchClosed("transport completed after deadline")
-        return result
+    async def arun_effect(self, effect, *args, **kwargs):
+        """Await exactly one prepared async API attempt, never deferred work."""
+        if asyncio.get_running_loop() is not self._effect_loop:
+            raise C1DispatchClosed("transport must use the owner loop")
+        try:
+            async with self._gate:
+                self._effect_task = asyncio.current_task()
+                self._check_deadline()
+                if not self.claimed or not inspect.iscoroutinefunction(effect):
+                    raise C1DispatchClosed("transport must be an async single-attempt callable")
+                if not await asyncio.to_thread(self._claim_effect):
+                    raise C1DispatchClosed("dispatch already claimed or uncertain")
+                state = await asyncio.to_thread(self.readback)
+                # Same critical section, after ALL blocking I/O. No await between
+                # this final state/time check and entry into the transport body.
+                if state != "EFFECT_STARTED":
+                    raise C1DispatchClosed("transport boundary closed")
+                self._check_deadline()
+                remaining = min(
+                    self.deadline - time.monotonic(),
+                    (self.expires_at - _utc_now()).total_seconds(),
+                )
+                async with asyncio.timeout(remaining):
+                    self._check_deadline()
+                    result = await effect(*args, **kwargs)
+                self._check_deadline()
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise C1DispatchClosed("transport returned deferred work")
+                await asyncio.to_thread(self._finish_effect)
+                self._check_deadline()
+                return result
+        except SystemExit as exc:
+            await self.aclose()
+            raise RuntimeError("C1 transport exited") from exc
+        except BaseException:
+            await self.aclose()
+            raise
 
 
 def _c1_binding_callback():
@@ -402,13 +416,13 @@ async def run_c1_telegram_personal(
         async with _routed_scope(runner, source):
             from gateway.session_identity import canonical_identity
             runtime_identity = canonical_identity(source, runner=runner)
-            dispatch = C1TelegramDispatch(runtime_identity.runtime_home, identity)
+            dispatch = await C1TelegramDispatch.create(runtime_identity.runtime_home, identity)
             if not dispatch.claimed:
-                logger.warning("C1 Telegram request already recorded: %s", dispatch.readback())
+                logger.warning("C1 Telegram request already recorded: %s", await asyncio.to_thread(dispatch.readback))
                 return True, None
             callback = _c1_binding_callback()
             if callback is None:
-                dispatch.uncertain()
+                await dispatch.aclose()
                 logger.error("C1 Telegram fenced binding is unavailable; consuming without agent fallback")
                 return True, None
             hook_source = source.to_dict()
@@ -429,17 +443,17 @@ async def run_c1_telegram_personal(
                 ),
                 timeout=C1_TELEGRAM_HOOK_TIMEOUT_SECONDS,
             )
-            # EFFECT_FINISHED only records that the synchronous effect returned;
+            # EFFECT_FINISHED only records that the async transport returned;
             # delivery/receipt truth still belongs to the downstream C1 ledger.
-            if dispatch.readback() == "DISPATCHING":
-                dispatch.uncertain()
+            if await asyncio.to_thread(dispatch.readback) == "DISPATCHING":
+                await dispatch.aclose()
     except asyncio.CancelledError:
         if dispatch is not None:
-            dispatch.uncertain()
+            await dispatch.aclose()
         raise
     except Exception as exc:
         if dispatch is not None:
-            dispatch.uncertain()
+            await dispatch.aclose()
         logger.warning(
             "C1 Telegram binding failed (%s); consuming without agent fallback",
             type(exc).__name__,
