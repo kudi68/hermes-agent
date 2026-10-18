@@ -1,6 +1,6 @@
 # C1 Telegram 部署 Checklist
 
-**狀態：僅準備，未部署。** 不裝金鑰、不重啟、不解閘、不送 live 訊息。候選分支 `chief-c1-patch`；F1–F3 修補後的精確程式 commit 為 `0dc24c171e9c78223f9bb402400d69db3e66e101`（本清單的後續文件 commit 不改程式）；分支 HEAD 以本地 `git rev-parse chief-c1-patch` 讀回；本地 commit 不代表遠端 PR 已更新。
+**狀態：僅準備，未部署。** 不裝金鑰、不重啟、不解閘、不送 live 訊息。候選程式固定為 `4d17946314363b39cdf7a712b34655d9e2b03f21`（含 F1–F3／F2 async 與 R4 修補；本清單的後續文件 commit 不改程式）；在部署程式 checkout 以 `git rev-parse HEAD` 與該完整 SHA 比對，不以可移動的分支 HEAD 作部署 pin；本地 commit 不代表遠端 PR 已更新。
 
 ## 部署前停止條件
 
@@ -27,9 +27,10 @@
 
 ## F2 async transport binding 契約（第二輪；部署前必讀）
 
-本段取代舊同步 effect 假設；上方 `0dc24c...` pin 為歷史版本，不含 F2 第二輪，
-不可依該 pin 部署。新候選以 F2-DESIGN.md 的基線／本輪本機 commit 與實際 tree
-比對為準；正式 binding／獨立審查／production admission 仍未證明，維持不部署。
+本段取代舊同步 effect 假設；本清單唯一候選程式 pin 為
+`4d17946314363b39cdf7a712b34655d9e2b03f21`，包含 F2 async 與 R4 修補。
+F2-DESIGN.md 的歷史基線不作部署 pin；正式 binding／production admission 仍須
+另行取得證據，離線獨立審查不代表部署授權，維持不部署。
 
 - consumer 使用 `await C1TelegramDispatch.create(...)`，SQLite 初始化／claim／readback／
   terminal state 都移到 worker；最後 durable read 回來後，在同一 owner-loop 臨界區
