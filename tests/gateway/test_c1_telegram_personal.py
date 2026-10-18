@@ -963,6 +963,56 @@ async def test_concurrent_duplicate_only_claims_one_dispatch():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_distinct_messages_only_one_is_processed():
+    from hermes_constants import get_hermes_home
+    from gateway.run_inbound_consumer import _telegram_c1_identity
+
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    hook_messages = []
+
+    def hold_first(*, c1_dispatch, **kwargs):
+        hook_messages.append(kwargs["message_id"])
+        if kwargs["message_id"] == "17":
+            entered.set()
+            try:
+                if not release.wait(10):
+                    raise AssertionError("first request did not release")
+            finally:
+                finished.set()
+        return binding(c1_dispatch=c1_dispatch, **kwargs)
+
+    _set_hook(hold_first)
+    first_runner = _runner()
+    second_runner = _runner()
+    first = asyncio.create_task(
+        first_runner._handle_message(_event(message_id=17, update_id=100))
+    )
+    second_event = _event(message_id=18, update_id=101)
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert await second_runner._handle_message(second_event) is None
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        await first
+
+    second_identity = _telegram_c1_identity(second_event, second_event.source)
+    second_record = C1TelegramDispatch.read_request(
+        get_hermes_home(), second_identity["request_id"],
+    )
+    assert hook_messages == ["17"]
+    assert len(binding.identities) == 1
+    assert c1.executions == 1
+    assert len(gateway.sends) == 1
+    assert second_record["status"] == "UNCERTAIN"
+    first_runner._handle_message_with_agent.assert_not_awaited()
+    second_runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("wrapped", [False, True])
 async def test_sync_or_deferred_effect_is_rejected_before_its_body_can_run(wrapped):
     effects, dispatches = [], []
