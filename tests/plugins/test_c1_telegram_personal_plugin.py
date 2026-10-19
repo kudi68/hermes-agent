@@ -312,7 +312,7 @@ def test_initializer_binds_trusted_request_sends_once_and_reads_pinned_source(
         "PASS hmac_file",
         "PASS c1_db_writable",
         "PASS binding_registered",
-        "PASS gateway_version_4f36202",
+        "PASS gateway_version_c4cd640",
     ]
 
     for cleanup in reversed(context.unload_callbacks):

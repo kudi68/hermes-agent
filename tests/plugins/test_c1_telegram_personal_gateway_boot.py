@@ -79,6 +79,8 @@ def _private_dir(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
+# Spawns and reaps its own gateway in a private HOME with no platforms or network.
+@pytest.mark.spawns_gateway_lookalike
 def test_real_gateway_boot_writes_binding_marker_for_its_own_pid(tmp_path):
     agent_ops_repo = os.environ.get("HERMES_TEST_C1_AGENT_OPS_REPO")
     source_repo = os.environ.get("HERMES_TEST_C1_SOURCE_REPO")
@@ -128,46 +130,27 @@ def test_real_gateway_boot_writes_binding_marker_for_its_own_pid(tmp_path):
         "HERMES_GATEWAY_LOCK_DIR": str(home / "state" / "locks"),
         "HERMES_DISABLE_LAZY_INSTALLS": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
-        "HERMES_TEST_C1_STARTUP_DONE": str(tmp_path / "startup-plugin-discovery.done"),
         # The child's HERMES_HOME is this test's tmp_path, not a live install.
         "HERMES_STATE_DB_GUARD_BYPASS": "1",
         "HTTPS_PROXY": blackhole,
         "HTTP_PROXY": blackhole,
         "ALL_PROXY": blackhole,
     }
-    launcher = (
-        "import os, sys\n"
-        "from pathlib import Path\n"
-        "sys.path.insert(0, sys.argv[1])\n"
-        "from gateway.run_startup import GatewayStartupMixin\n"
-        "_original = GatewayStartupMixin._start_register_plugins_relay_hooks\n"
-        "def _observed():\n"
-        "    _original()\n"
-        "    Path(os.environ['HERMES_TEST_C1_STARTUP_DONE']).touch()\n"
-        "GatewayStartupMixin._start_register_plugins_relay_hooks = staticmethod(_observed)\n"
-        "sys.argv = ['hermes', '--profile', 'chief', 'gateway', 'run', '--no-supervise']\n"
-        "from hermes_cli.main import main\n"
-        "sys.exit(main())\n"
-    )
     output = tmp_path / "gateway-run.log"
     with output.open("wb") as stream:
         process = subprocess.Popen(
-            [sys.executable, "-I", "-c", launcher, str(hermes_repo)],
+            # The live command line must read as a chief gateway for the strict PID identity check.
+            [sys.executable, "-m", "hermes_cli.main", "--profile", "chief", "gateway", "run", "--no-supervise"],
             cwd=hermes_repo, env=env, stdout=stream, stderr=subprocess.STDOUT,
         )
     marker = profile_home / "c1" / "c1_telegram_personal.binding.json"
-    startup_done = tmp_path / "startup-plugin-discovery.done"
     pid_file = profile_home / "gateway.pid"
     try:
         wait_until(
-            lambda: marker.exists() or startup_done.exists() or process.poll() is not None,
+            lambda: marker.exists() or process.poll() is not None,
             timeout=90,
-            what="C1 binding registration or post-PID plugin discovery",
+            what="C1 binding registration",
         )
-        if startup_done.exists():
-            assert pid_file.is_file(), "gateway completed plugin discovery without its PID file"
-            pid_record = json.loads(pid_file.read_text(encoding="utf-8"))
-            assert pid_record["pid"] == process.pid
         preflight = subprocess.run(
             [sys.executable, "-m", "tools.agent_ops_c1.operator_ops", "preflight"],
             cwd=agent_ops_repo,
@@ -189,10 +172,10 @@ def test_real_gateway_boot_writes_binding_marker_for_its_own_pid(tmp_path):
             "PASS hmac_file",
             "PASS c1_db_writable",
             "PASS binding_registered",
-            "PASS gateway_version_4f36202",
+            "PASS gateway_version_c4cd640",
         ]
         assert marker.exists(), (
-            "gateway completed post-PID plugin discovery without the C1 binding marker:\n"
+            "gateway boot did not write the C1 binding marker:\n"
             + output.read_text(encoding="utf-8", errors="replace")[-2000:]
             + "\npreflight:\n" + preflight.stdout + preflight.stderr
         )
