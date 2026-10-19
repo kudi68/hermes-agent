@@ -335,6 +335,36 @@ class C1TelegramDispatch:
             raise
 
 
+C1_TELEGRAM_PLUGIN = "c1_telegram_personal"
+C1_PID_NOT_CLAIMED_ERROR = "C1 initializer requires this profile's live Gateway."
+
+
+def retry_c1_binding_after_pid_claim() -> bool:
+    """Load the C1 initializer once more after this process claimed ``gateway.pid``.
+
+    Config loading discovers plugins before the PID claim, so the initializer's live-Gateway
+    check fails closed on that first pass and discovery never retries it. Only a bundled,
+    failed C1 load is retried; the plugin itself re-checks the PID identity. True on success.
+    """
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    loaded = manager._plugins.get(C1_TELEGRAM_PLUGIN)
+    if (
+        loaded is None
+        or loaded.enabled
+        or loaded.error != C1_PID_NOT_CLAIMED_ERROR
+        or loaded.manifest.source != "bundled"
+    ):
+        return False
+    manager._load_plugin(loaded.manifest)
+    retried = manager._plugins.get(C1_TELEGRAM_PLUGIN)
+    if retried is not None and retried.enabled and not retried.error:
+        logger.info("C1 Telegram initializer registered after the gateway PID claim")
+        return True
+    return False
+
+
 def _c1_binding_callback():
     from hermes_cli.plugins import has_hook, iter_hook_callbacks
 
