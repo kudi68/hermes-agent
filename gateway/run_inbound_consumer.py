@@ -107,6 +107,8 @@ def _canonical_digest(value: dict) -> str:
 
 def is_c1_telegram_personal_target(event: Any, source: Any, runner: Any) -> bool:
     """Use the canonical runtime identity; a primary profile can be None on the wire."""
+    if getattr(event, "internal", False):
+        return False
     platform = getattr(getattr(source, "platform", None), "value", None)
     raw_text = getattr(getattr(event, "raw_message", None), "text", None)
     fixed_request = (

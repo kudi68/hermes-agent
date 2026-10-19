@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.run_inbound_consumer import (
     C1DispatchClosed,
@@ -191,6 +192,20 @@ class FakeC1Binding:
         return {"action": "handled"}
 
 
+class _C1IngressProbeAdapter(BasePlatformAdapter):
+    async def connect(self, *, is_reconnect=False):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        return SendResult(success=True, message_id="probe")
+
+
 def _set_hook(callback):
     from hermes_cli.plugins import get_plugin_manager
 
@@ -341,6 +356,40 @@ async def test_fixed_request_is_consumed_before_busy_session_routing():
     runner._handle_message_with_agent.assert_not_awaited()
     assert c1.executions == 1
     assert len(gateway.sends) == 1
+
+
+@pytest.mark.asyncio
+async def test_internal_fixed_request_uses_normal_adapter_session_dispatch(tmp_path):
+    from gateway.session_identity import RoutingIdentity
+
+    adapter = _C1IngressProbeAdapter(
+        PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM,
+    )
+    adapter.gateway_runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=False),
+        _transport_owner=lambda _source: None,
+    )
+    adapter._message_handler = AsyncMock(return_value=None)
+    adapter._process_message_background = AsyncMock(return_value=None)
+    adapter._dispatch_inline_reply = AsyncMock()
+    event = _event()
+    event.internal = True
+    event.source._identity = RoutingIdentity(
+        transport_profile="chief",
+        runtime_profile="chief",
+        authorization_home=tmp_path,
+        runtime_home=tmp_path,
+        multiplexed=False,
+    )
+
+    session_key = adapter._event_session_key(event)
+    await adapter.handle_message(event)
+
+    assert event._gateway_accepted is True
+    assert session_key in adapter._session_tasks
+    assert adapter._session_tasks[session_key] in adapter._background_tasks
+    adapter._dispatch_inline_reply.assert_not_awaited()
+    await adapter._session_tasks[session_key]
 
 
 @pytest.mark.asyncio
