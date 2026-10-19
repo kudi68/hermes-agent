@@ -234,7 +234,7 @@ class C1TelegramDispatch:
             )
 
     def _check_deadline(self):
-        if self._closed or time.monotonic() >= self.deadline or _utc_now() > self.expires_at:
+        if self._closed or time.monotonic() >= self.deadline or _utc_now() >= self.expires_at:
             raise C1DispatchClosed("dispatch deadline expired or closed")
 
     def check_active(self) -> None:
@@ -396,7 +396,7 @@ def _telegram_c1_identity(event: Any, source: Any) -> dict | None:
     issued_at = message_date.astimezone(UTC)
     expires_at = issued_at + timedelta(minutes=5)
     now = _utc_now()
-    if now > expires_at or issued_at > now + timedelta(seconds=C1_TELEGRAM_FUTURE_SKEW_SECONDS):
+    if now >= expires_at or issued_at > now + timedelta(seconds=C1_TELEGRAM_FUTURE_SKEW_SECONDS):
         return None
     return {
         "schema": _C1_TELEGRAM_IDENTITY_SCHEMA,

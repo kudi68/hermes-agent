@@ -632,7 +632,8 @@ async def test_binding_error_consumes_without_agent_fallback():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("offset", [
     timedelta(minutes=-10), timedelta(seconds=-301), timedelta(seconds=31),
-    timedelta(minutes=-5, microseconds=-1), timedelta(seconds=30, microseconds=1),
+    timedelta(minutes=-5), timedelta(minutes=-5, microseconds=-1),
+    timedelta(seconds=30, microseconds=1),
 ])
 async def test_expired_or_implausibly_future_request_never_reaches_binding(offset):
     calls = []
@@ -646,7 +647,9 @@ async def test_expired_or_implausibly_future_request_never_reaches_binding(offse
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("offset", [timedelta(minutes=-5), timedelta(seconds=30)])
+@pytest.mark.parametrize("offset", [
+    timedelta(minutes=-5, microseconds=1), timedelta(seconds=30),
+])
 async def test_request_at_time_boundaries_is_admitted(offset):
     calls = []
     _set_hook(lambda *, c1_dispatch, **kwargs: calls.append(kwargs))
@@ -791,13 +794,14 @@ async def test_unfenced_or_ambiguous_binding_is_never_invoked(kind):
 
 
 @pytest.mark.asyncio
-async def test_callback_cannot_start_an_effect_after_message_expiry(monkeypatch):
+@pytest.mark.parametrize("elapsed", [timedelta(minutes=5), timedelta(minutes=6)])
+async def test_callback_cannot_start_an_effect_after_message_expiry(monkeypatch, elapsed):
     effects, dispatches = [], []
 
     def expired_preparation(*, c1_dispatch, **_kwargs):
         dispatches.append(c1_dispatch)
         monkeypatch.setattr(
-            "gateway.run_inbound_consumer._utc_now", lambda: TEST_NOW + timedelta(minutes=6)
+            "gateway.run_inbound_consumer._utc_now", lambda: TEST_NOW + elapsed
         )
         c1_dispatch.run_effect(_append_effect, effects, "expired")
 
