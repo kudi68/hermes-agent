@@ -153,6 +153,8 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # These are test-infrastructure knobs, not credentials — same class as the
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
 # forwarded below.
+# The C1 integration test uses these two local checkout paths to compose its
+# isolated Agent Ops and pinned-source fixtures.
 # SSL_CERT_FILE/DIR are trust-store locations: the pinned interpreter's
 # OpenSSL has no compiled-in bundle path on NixOS, so network tests (PM
 # downloads, channel reads) need the host's pointer to verify TLS.
@@ -164,7 +166,8 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
   HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
-  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE; do
+  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE \
+  HERMES_TEST_C1_AGENT_OPS_REPO HERMES_TEST_C1_SOURCE_REPO; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi

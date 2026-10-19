@@ -1,0 +1,19 @@
+name: c1_telegram_personal
+version: "0.1.0"
+description: "Opt-in, fail-closed C1 Personal Telegram admission for the chief profile."
+manifest_version: 2
+config_schema:
+  enabled:
+    type: boolean
+    default: false
+    description: "Explicitly enable the C1 Telegram binding for this profile."
+  agent_ops_repo:
+    type: string
+    required: true
+    description: "Absolute path to the reviewed feat/c1-wiring Agent Ops checkout."
+  source_repo:
+    type: string
+    required: true
+    description: "Absolute path to the pinned Personal AI OS source checkout."
+provides_hooks:
+  - post_gateway_admission
