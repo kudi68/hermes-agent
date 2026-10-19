@@ -189,11 +189,15 @@ class C1TelegramDispatch:
                 yield db
 
     def readback(self) -> str:
-        return self.read_request(self.path.parent, self.request_id)["status"]
+        return self.read_request(
+            self.path.parent, self.request_id, classify_inflight=False
+        )["durable_status"]
 
     @staticmethod
-    def read_request(runtime_home: Path, request_id: str) -> dict | None:
-        """Read a request in a fresh process without creating or changing its ledger."""
+    def read_request(
+        runtime_home: Path, request_id: str, *, classify_inflight: bool = True
+    ) -> dict | None:
+        """Read without mutation; fresh readers treat abandoned in-flight states as uncertain."""
         path = Path(runtime_home) / "c1-telegram-dispatch.sqlite3"
         if not path.is_file():
             return None
@@ -201,7 +205,18 @@ class C1TelegramDispatch:
             row = db.execute(
                 "SELECT status, updated_at FROM requests WHERE request_id = ?", (request_id,)
             ).fetchone()
-        return {"request_id": request_id, "status": row[0], "updated_at": row[1]} if row else None
+        if row is None:
+            return None
+        durable_status = row[0]
+        status = durable_status
+        if classify_inflight and durable_status in {"DISPATCHING", "EFFECT_STARTED"}:
+            status = "UNCERTAIN"
+        return {
+            "request_id": request_id,
+            "status": status,
+            "durable_status": durable_status,
+            "updated_at": row[1],
+        }
 
     def _worker_bridge(self, async_method, *args, **kwargs):
         # Reject BEFORE constructing/scheduling a coroutine on its own loop.
@@ -216,19 +231,29 @@ class C1TelegramDispatch:
     def uncertain(self) -> None:
         self._worker_bridge(self.aclose)
 
-    async def aclose(self) -> None:
+    async def _close(self) -> None:
         # Close immediately, before any DB wait or effect lock. A read already
         # running on a worker cannot reopen this owner-loop fence when it returns.
         self._closed = True
         active = self._effect_task
         if active is not None and active is not asyncio.current_task() and not active.done():
             active.cancel()
-        await _c1_db_work(self._mark_uncertain)
+        await _c1_db_work(self._mark_closed_outcome)
 
-    def _mark_uncertain(self) -> None:
+    async def aclose(self) -> None:
+        """Close the dispatch; distinguish a proven no-send from a started effect."""
+        await self._close()
+
+    async def reject_not_sent(self) -> None:
+        """Reject before sending; an already-started effect remains uncertain."""
+        await self._close()
+
+    def _mark_closed_outcome(self) -> None:
         with self._connect() as db:
             db.execute(
-                "UPDATE requests SET status = 'UNCERTAIN', updated_at = ? "
+                "UPDATE requests SET status = CASE "
+                "WHEN status = 'DISPATCHING' THEN 'REJECTED_NOT_SENT' "
+                "ELSE 'UNCERTAIN' END, updated_at = ? "
                 "WHERE request_id = ? AND status IN ('DISPATCHING', 'EFFECT_STARTED', 'EFFECT_FINISHED')",
                 (_utc_now().isoformat(), self.request_id),
             )
@@ -444,15 +469,17 @@ async def run_c1_telegram_personal(
             dispatch = await C1TelegramDispatch.create(runtime_identity.runtime_home, identity)
             if not admitted:
                 if dispatch.claimed:
-                    await dispatch.aclose()
-                logger.warning("C1 Telegram request rejected/UNCERTAIN: busy; consumed without queue or send")
+                    await dispatch.reject_not_sent()
+                logger.warning(
+                    "C1 Telegram request rejected before send: busy; consumed without queue or send"
+                )
                 return True, None
             if not dispatch.claimed:
                 logger.warning("C1 Telegram request already recorded: %s", await _c1_db_work(dispatch.readback))
                 return True, None
             callback = _c1_binding_callback()
             if callback is None:
-                await dispatch.aclose()
+                await dispatch.reject_not_sent()
                 logger.error("C1 Telegram fenced binding is unavailable; consuming without agent fallback")
                 return True, None
             hook_source = source.to_dict()
@@ -478,7 +505,7 @@ async def run_c1_telegram_personal(
             # EFFECT_FINISHED only records that the async transport returned;
             # delivery/receipt truth still belongs to the downstream C1 ledger.
             if await _c1_db_work(dispatch.readback) == "DISPATCHING":
-                await dispatch.aclose()
+                await dispatch.reject_not_sent()
     except asyncio.CancelledError:
         if dispatch is not None:
             await dispatch.aclose()

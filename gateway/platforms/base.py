@@ -4029,6 +4029,43 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
+        # The fixed C1 request must reach the runner's admission and C1 checks
+        # before any adapter busy lane can queue, steer, interrupt, or merge it.
+        if event.source.platform == Platform.TELEGRAM:
+            from gateway.run_inbound_consumer import (
+                C1_TELEGRAM_REQUEST,
+                is_c1_telegram_personal_target,
+            )
+            raw_text = getattr(getattr(event, "raw_message", None), "text", None)
+            if event.text == C1_TELEGRAM_REQUEST or raw_text == C1_TELEGRAM_REQUEST:
+                runner = getattr(self, "gateway_runner", None)
+                if runner is None:
+                    runner = getattr(self._message_handler, "__self__", None)
+                if runner is None:
+                    logger.warning("Consuming fixed C1 request without a GatewayRunner")
+                    event._gateway_accepted = True
+                    return
+                try:
+                    is_c1_target = is_c1_telegram_personal_target(
+                        event, event.source, runner
+                    )
+                except Exception:
+                    logger.warning(
+                        "Consuming fixed C1 request with unresolved runtime identity",
+                        exc_info=True,
+                    )
+                    event._gateway_accepted = True
+                    return
+                if is_c1_target:
+                    event._gateway_accepted = True
+                    try:
+                        await self._dispatch_inline_reply(event)
+                    except Exception:
+                        logger.error(
+                            "Fixed C1 request dispatch failed; request remains consumed",
+                            exc_info=True,
+                        )
+                    return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)

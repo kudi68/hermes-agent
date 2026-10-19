@@ -689,7 +689,7 @@ async def test_timeout_fences_late_callback_side_effects(monkeypatch):
     try:
         assert await runner._handle_message(_event()) is None
         assert entered.is_set()
-        assert dispatches[0].readback() == "UNCERTAIN"
+        assert dispatches[0].readback() == "REJECTED_NOT_SENT"
         runner._handle_message_with_agent.assert_not_awaited()
     finally:
         release.set()
@@ -697,13 +697,13 @@ async def test_timeout_fences_late_callback_side_effects(monkeypatch):
 
     assert gateway.sends == []
     assert c1.executions == 0
-    assert dispatches[0].readback() == "UNCERTAIN"
+    assert dispatches[0].readback() == "REJECTED_NOT_SENT"
 
-    # A new reader opens the persisted ledger without carrying the callback object.
+    # A new reader can tell this fenced callback never started its transport.
     dispatch = dispatches[0]
-    assert C1TelegramDispatch.read_request(dispatch.path.parent, dispatch.request_id)["status"] == "UNCERTAIN"
+    assert C1TelegramDispatch.read_request(dispatch.path.parent, dispatch.request_id)["status"] == "REJECTED_NOT_SENT"
 
-    # A restarted consumer reads the persisted uncertain state and never retries it.
+    # A restarted consumer reads the persisted terminal state and never retries it.
     replay = FakeC1Binding(FakeGatewayC1Adapter(c1))
     _set_hook(replay)
     await _runner()._handle_message(_event(update_id=999))
@@ -811,7 +811,7 @@ async def test_callback_cannot_start_an_effect_after_message_expiry(monkeypatch,
     assert await runner._handle_message(_event()) is None
 
     assert effects == []
-    assert dispatches[0].readback() == "UNCERTAIN"
+    assert dispatches[0].readback() == "REJECTED_NOT_SENT"
     runner._handle_message_with_agent.assert_not_awaited()
 
 
@@ -881,7 +881,7 @@ async def test_late_effect_completion_cannot_clear_uncertain_or_retry(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_cancellation_persists_uncertain_and_fences_the_released_callback():
+async def test_cancellation_records_not_sent_and_fences_the_released_callback():
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     effects, dispatches = [], []
 
@@ -902,7 +902,7 @@ async def test_cancellation_persists_uncertain_and_fences_the_released_callback(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert dispatches[0].readback() == "UNCERTAIN"
+        assert dispatches[0].readback() == "REJECTED_NOT_SENT"
     finally:
         release.set()
         assert await asyncio.to_thread(finished.wait, 2)
@@ -1011,7 +1011,7 @@ async def test_concurrent_distinct_messages_only_one_is_processed():
     assert len(binding.identities) == 1
     assert c1.executions == 1
     assert len(gateway.sends) == 1
-    assert second_record["status"] == "UNCERTAIN"
+    assert second_record["status"] == "REJECTED_NOT_SENT"
     first_runner._handle_message_with_agent.assert_not_awaited()
     second_runner._handle_message_with_agent.assert_not_awaited()
 
@@ -1035,11 +1035,11 @@ async def test_sync_or_deferred_effect_is_rejected_before_its_body_can_run(wrapp
     assert await _runner()._handle_message(_event()) is None
 
     assert effects == []
-    assert dispatches[0].readback() == "UNCERTAIN"
+    assert dispatches[0].readback() == "REJECTED_NOT_SENT"
 
 
 @pytest.mark.asyncio
-async def test_binding_system_exit_is_contained_and_persisted_as_uncertain():
+async def test_binding_system_exit_is_contained_and_persisted_as_not_sent():
     dispatches = []
 
     def exits(*, c1_dispatch, **_kwargs):
@@ -1051,7 +1051,7 @@ async def test_binding_system_exit_is_contained_and_persisted_as_uncertain():
 
     assert await runner._handle_message(_event()) is None
 
-    assert dispatches[0].readback() == "UNCERTAIN"
+    assert dispatches[0].readback() == "REJECTED_NOT_SENT"
     runner._handle_message_with_agent.assert_not_awaited()
 
 
@@ -1083,14 +1083,14 @@ async def test_preparation_that_outlives_timeout_cannot_send_its_late_result(mon
         assert entered.is_set()
         assert c1.executions == 1  # C1 admission started before the timeout.
         assert gateway.sends == []
-        assert dispatches[0].readback() == "UNCERTAIN"
+        assert dispatches[0].readback() == "REJECTED_NOT_SENT"
     finally:
         release.set()
         assert await asyncio.to_thread(finished.wait, 2)
 
     assert gateway.sends == []
     assert c1.records[binding.identities[0]["request_id"]].status == "RETURN_UNCERTAIN"
-    assert dispatches[0].readback() == "UNCERTAIN"
+    assert dispatches[0].readback() == "REJECTED_NOT_SENT"
     runner._handle_message_with_agent.assert_not_awaited()
 
 
@@ -1425,7 +1425,7 @@ async def main():
             # Timed-out preparation is still in flight: do not admit its follower.
             assert await asyncio.wait_for(consume(n), 3) == (True, None)
             assert invoked == ['0'], invoked
-            assert [d.readback() for d in ds[:-1]] == ['UNCERTAIN'] * (n+1)
+            assert [d.readback() for d in ds[:-1]] == ['REJECTED_NOT_SENT'] * (n+1)
         finally:
             release.set()
             free.set()
@@ -1434,9 +1434,11 @@ async def main():
         await async_wait_until(lambda: not m._C1_IN_FLIGHT.locked(), timeout=3)
         assert await asyncio.wait_for(consume(n+1), 3) == (True, None)
         assert invoked == ['0', str(n+1)], invoked
-    assert all(d.readback() == 'UNCERTAIN' for d in ds)
+    expected_state = 'UNCERTAIN' if mode == 'dispatch' else 'REJECTED_NOT_SENT'
+    assert all(d.readback() == expected_state for d in ds)
     assert sends == [], sends
     assert await asyncio.wait_for(asyncio.to_thread(lambda: 'recovered'), 3) == 'recovered'
+
     print('BOUNDED UNCERTAIN NO_SEND EXECUTOR_RECOVERED', n, mode, flush=True)
 asyncio.run(main())
 '''
@@ -1450,3 +1452,239 @@ asyncio.run(main())
         pytest.fail("R4 shared executor circular wait; bounded child killed after 16s")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "BOUNDED UNCERTAIN NO_SEND EXECUTOR_RECOVERED" in result.stdout
+
+def _pin_c1_test_identity(event, home):
+    from gateway.session_identity import RoutingIdentity
+
+    event.source._identity = RoutingIdentity(
+        transport_profile="chief",
+        runtime_profile="chief",
+        authorization_home=home,
+        runtime_home=home,
+        multiplexed=False,
+    )
+
+
+def _real_c1_test_adapter(runner, busy_text_mode="interrupt"):
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+    class Adapter(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(
+                PlatformConfig(enabled=True, token="fixture-token"),
+                Platform.TELEGRAM,
+            )
+            self.sent = []
+            self._owner_profile = "chief"
+            self._busy_text_mode = busy_text_mode
+            self._busy_text_debounce_seconds = 0
+            self._busy_text_hard_cap_seconds = 0
+
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            pass
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            self.sent.append(content)
+            return SendResult(success=True, message_id=f"sent-{len(self.sent)}")
+
+        async def get_chat_info(self, chat_id):
+            return {"id": chat_id, "type": "private"}
+
+    adapter = Adapter()
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(runner._handle_message)
+    adapter.set_busy_session_handler(AsyncMock(return_value=True))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._intake_adapter_for = lambda _source: adapter
+    return adapter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy_text_mode", ["queue", "steer", "interrupt"])
+async def test_real_adapter_consumes_fixed_request_before_busy_mode(
+    tmp_path, busy_text_mode
+):
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    _set_hook(binding)
+    runner = _runner()
+    adapter = _real_c1_test_adapter(runner, busy_text_mode)
+    event = _event()
+    _pin_c1_test_identity(event, tmp_path)
+    session_key = adapter._event_session_key(event)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(event)
+
+    assert binding.calls == 1
+    assert c1.executions == 1
+    assert len(gateway.sends) == 1
+    assert adapter._pending_messages == {}
+    adapter._busy_session_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_real_adapter_consumes_fixed_request_before_shared_busy_burst(
+    tmp_path, monkeypatch
+):
+    dispatch_shared_busy_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "gateway.session_ingress.dispatch_shared_busy",
+        dispatch_shared_busy_mock,
+    )
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    _set_hook(binding)
+    runner = _runner()
+    runner.session_authority = object()
+    adapter = _real_c1_test_adapter(runner, "queue")
+    event = _event()
+    _pin_c1_test_identity(event, tmp_path)
+    session_key = adapter._event_session_key(event)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await asyncio.wait_for(adapter.handle_message(event), timeout=2)
+
+    assert binding.calls == 1
+    assert len(gateway.sends) == 1
+    dispatch_shared_busy_mock.assert_not_awaited()
+    assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_real_adapter_checks_fixed_request_before_clarify_bypass(
+    tmp_path, monkeypatch
+):
+    from gateway import run_inbound_consumer as consumer
+    from tools import clarify_gateway
+
+    order = []
+    original_target = consumer.is_c1_telegram_personal_target
+    original_pending = clarify_gateway.get_pending_for_session
+
+    def target_spy(*args, **kwargs):
+        order.append("c1-gate")
+        return original_target(*args, **kwargs)
+
+    def pending_spy(*args, **kwargs):
+        order.append("clarify")
+        return original_pending(*args, **kwargs)
+
+    monkeypatch.setattr(consumer, "is_c1_telegram_personal_target", target_spy)
+    monkeypatch.setattr(
+        clarify_gateway, "get_pending_for_session", pending_spy,
+    )
+    gateway = FakeGatewayPort()
+    c1 = FakeDurableC1(gateway)
+    binding = FakeC1Binding(FakeGatewayC1Adapter(c1))
+    _set_hook(binding)
+    runner = _runner()
+    adapter = _real_c1_test_adapter(runner)
+    event = _event()
+    _pin_c1_test_identity(event, tmp_path)
+    session_key = adapter._event_session_key(event)
+    clarify_gateway.clear_session(session_key)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    clarify_gateway.register("clarify-c1", session_key, "Pick one", ["A", "B"])
+
+    try:
+        await adapter.handle_message(event)
+        assert binding.calls == 1
+        assert len(gateway.sends) == 1
+        assert order[0] == "c1-gate"
+        assert "clarify" not in order
+    finally:
+        clarify_gateway.clear_session(session_key)
+
+
+@pytest.mark.asyncio
+async def test_agent_drain_discards_fixed_request_and_preserves_next_fifo_item(
+    tmp_path
+):
+    runner = _runner()
+    adapter = _real_c1_test_adapter(runner)
+    fixed = _event()
+    ordinary = _event(
+        text="ordinary follow-up",
+        message_id=18,
+        update_id=101,
+    )
+    _pin_c1_test_identity(fixed, tmp_path)
+    _pin_c1_test_identity(ordinary, tmp_path)
+    session_key = adapter._event_session_key(fixed)
+    state = SimpleNamespace(
+        conversation=SimpleNamespace(queued_events=[ordinary]),
+        turn=SimpleNamespace(agent=None, busy_ack_ts=0),
+    )
+    runner._peek_session_state = lambda _key: state
+    runner._session_state = lambda _key: state
+    adapter._pending_messages[session_key] = fixed
+
+    pending_event, pending = await runner._run_agent_drain_pending(
+        {"final_response": "done"},
+        adapter,
+        fixed.source,
+        session_key,
+    )
+
+    assert pending_event is ordinary
+    assert pending == "ordinary follow-up"
+    assert adapter._pending_messages == {}
+    assert state.conversation.queued_events == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_readback_distinguishes_not_sent_from_uncertain(tmp_path):
+    not_sent = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "not-sent",
+        "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    uncertain = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "uncertain",
+        "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+
+    await not_sent.reject_not_sent()
+    started = asyncio.Event()
+
+    async def in_flight_effect():
+        started.set()
+        await asyncio.Event().wait()
+
+    effect = asyncio.create_task(uncertain.arun_effect(in_flight_effect))
+    await asyncio.wait_for(started.wait(), 2)
+    await uncertain.aclose()
+    with pytest.raises((asyncio.CancelledError, C1DispatchClosed)):
+        await effect
+
+    assert not_sent.readback() == "REJECTED_NOT_SENT"
+    assert uncertain.readback() == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
+async def test_fresh_readback_classifies_abandoned_dispatch_states_as_uncertain(
+    tmp_path,
+):
+    dispatching = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "abandoned-dispatching",
+        "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    effect_started = await C1TelegramDispatch.create(tmp_path, {
+        "request_id": "abandoned-effect-started",
+        "expires_at": (TEST_NOW + timedelta(minutes=5)).isoformat(),
+    })
+    await asyncio.to_thread(effect_started._claim_effect)
+
+    for dispatch, durable_status in (
+        (dispatching, "DISPATCHING"),
+        (effect_started, "EFFECT_STARTED"),
+    ):
+        record = C1TelegramDispatch.read_request(tmp_path, dispatch.request_id)
+        assert record["status"] == "UNCERTAIN"
+        assert record["durable_status"] == durable_status
