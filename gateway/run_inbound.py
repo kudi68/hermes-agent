@@ -1218,6 +1218,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayPluginInjectionMixin)
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
+        if not is_internal:
+            from gateway.run_inbound_consumer import (
+                is_c1_telegram_personal_target,
+                run_c1_telegram_personal,
+            )
+            if is_c1_telegram_personal_target(event, source, self):
+                # Keep the existing Telegram lobby and drain gates, but consume this request
+                # before busy-session routing can queue it into an ordinary Agent turn.
+                if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+                    if self._should_send_telegram_lobby_reminder(source):
+                        return self._telegram_topic_root_lobby_message()
+                    return None
+                if self._external_drain_active:
+                    logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
+                    return t("gateway.busy.draining_maintenance")
+                _c1_consumed, _c1_reply = await run_c1_telegram_personal(
+                    self, event, source, _quick_key
+                )
+                if _c1_consumed:
+                    return _c1_reply
+
         _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply

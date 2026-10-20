@@ -1069,6 +1069,11 @@ class GatewayStartupMixin:
             from hermes_cli.plugins_cmd_remove import sweep_pending_plugin_deletes
             sweep_pending_plugin_deletes()  # trees a previous life still held when they were uninstalled
             discover_plugins()
+        # The C1 initializer needs this process's gateway.pid, which did not exist yet when config
+        # loading first discovered plugins; it gets one retry now, before any adapter connects.
+        with _log_suppressed(logging.WARNING, "C1 initializer retry failed at gateway startup", exc_info=True):
+            from gateway.run_inbound_consumer import retry_c1_binding_after_pid_claim
+            retry_c1_binding_after_pid_claim()
         # Relay entrypoints share the effective profile opt-out, including when a
         # deployment injects a URL. No URL or explicitly disabled -> no side effects.
         try:

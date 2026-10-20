@@ -1715,10 +1715,45 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         pending_event = None
         pending = None
         if result and adapter and session_key:
+            from gateway.run_inbound_consumer import (
+                C1_TELEGRAM_REQUEST,
+                is_c1_telegram_personal_target,
+            )
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            while pending_event is not None:
+                source_for_pending = getattr(pending_event, "source", None)
+                try:
+                    fixed_c1_request = is_c1_telegram_personal_target(
+                        pending_event, source_for_pending, self
+                    )
+                except Exception:
+                    raw_text = getattr(
+                        getattr(pending_event, "raw_message", None), "text", None
+                    )
+                    fixed_c1_request = (
+                        getattr(
+                            getattr(source_for_pending, "platform", None),
+                            "value",
+                            None,
+                        ) == "telegram"
+                        and (
+                            getattr(pending_event, "text", None) == C1_TELEGRAM_REQUEST
+                            or raw_text == C1_TELEGRAM_REQUEST
+                        )
+                    )
+                if not fixed_c1_request:
+                    break
+                logger.warning(
+                    "Discarding fixed C1 request found in pending queue for session %s",
+                    session_key,
+                )
+                pending_event = _dequeue_pending_event(adapter, session_key)
+                pending_event = self._promote_queued_event(
+                    session_key, adapter, pending_event
+                )
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
