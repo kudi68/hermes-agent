@@ -16,6 +16,7 @@ import socket
 import shlex
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
@@ -273,8 +274,8 @@ def _c1_runtime_launch_refusal_reason(
     if os.environ.get("HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME") == "1" and os.environ.get("HOME"):
         try:
             test_home = Path(os.environ["HOME"]).resolve()
-            tmp_root = Path("/tmp").resolve()
-            if test_home != tmp_root and test_home.is_relative_to(tmp_root):
+            tmp_roots = (Path(tempfile.gettempdir()).resolve(), Path("/private/tmp").resolve())
+            if any(test_home != root and test_home.is_relative_to(root) for root in tmp_roots):
                 return None
         except (OSError, RuntimeError, ValueError):
             pass  # An unresolvable HOME must still pass the normal launch checks.

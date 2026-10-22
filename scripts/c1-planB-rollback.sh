@@ -17,12 +17,41 @@ git -C "$runtime_root" diff --quiet
 git -C "$runtime_root" diff --cached --quiet
 git -C "$runtime_root" cat-file -e "$base^{commit}"
 
+# A failed deployment may already have unloaded the job. Other failures must stop rollback.
+if bootout_error=$(launchctl bootout "$domain/$label" 2>&1); then
+  :
+else
+  bootout_status=$?
+  case "$bootout_error" in
+    *"No such process"*|*"Could not find service"*)
+      printf 'C1 job is already unloaded; continuing rollback.\n'
+      ;;
+    *)
+      printf '%s\n' "$bootout_error" >&2
+      exit "$bootout_status"
+      ;;
+  esac
+fi
+
 # Detached checkout preserves feat/c1-wiring and refuses conflicting untracked files.
 git -C "$runtime_root" checkout --detach "$base"
 test "$(git -C "$runtime_root" rev-parse HEAD)" = "$base"
 cp -p "$plist_a" "$plist"
 cmp -s "$plist_a" "$plist"
 plutil -lint "$plist"
-launchctl bootout "$domain/$label"
 launchctl bootstrap "$domain" "$plist"
-launchctl print "$domain/$label"
+
+# bootstrap may return before launchd has started the process.
+for attempt in {1..35}; do
+  job_state=$(launchctl print "$domain/$label")
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*pid[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+      printf '%s\n' "$job_state"
+      ps -o pid,ppid,comm -p "${BASH_REMATCH[1]}"
+      exit 0
+    fi
+  done <<< "$job_state"
+  if [ "$attempt" -lt 35 ]; then sleep 1; fi
+done
+printf 'C1 job did not publish a PID within 35 checks.\n' >&2
+exit 1

@@ -96,3 +96,24 @@ def test_test_only_opt_out_rejects_home_symlink_outside_tmp(tmp_path, monkeypatc
     home.symlink_to(Path("/Users"), target_is_directory=True)
     monkeypatch.setenv("HOME", str(home))
     assert gateway._c1_runtime_launch_refusal_reason(parent_pid=42) is not None
+
+
+@pytest.mark.parametrize(
+    ("home", "allowed"),
+    [
+        ("/private/var/folders/c1-test/T/pytest-1/home", True),
+        ("/private/var/folders/c1-test/T", False),
+        ("/private/var/folders/c1-test/T-sibling/home", False),
+        ("/private/tmp/c1-test/home", True),
+    ],
+)
+def test_test_only_opt_out_accepts_macos_default_tmpdir(monkeypatch, home, allowed):
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: "/private/var/folders/c1-test/T")
+    monkeypatch.setenv("HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME", "1")
+    monkeypatch.setenv("HOME", home)
+    reason = gateway._c1_runtime_launch_refusal_reason(
+        parent_pid=42, project_root=Path("/outside-runtime"),
+    )
+    assert (reason is None) is allowed
