@@ -1,5 +1,5 @@
 WP4 已以 MODELLED fixtures 完成離線整合並通過作者測試 104/104；WP0.5 真實 transport 仍 UNPROVEN，不得當 live PASS。
-方案 B 的 r1 修正已 local commit：09b6950；576 passed／38 skipped／0 failed；real-boot 為 SKIPPED_NEEDS_ENV。
+方案 B 的 r2 M1／M2 已 local commit：5060638；本輪 delta 15 passed／0 skipped／0 failed；real-boot 未跑，SKIPPED_NEEDS_ENV。
 三個指定 feature branch 均為 PUSH NOT_EXECUTED：平台政策審查以「最新全域指示禁止 push」拒絕；main 未變，未 merge／開 PR。
 
 # 夜班交接 — WP4 ＋ 方案 B（2026-10-22）
@@ -47,25 +47,26 @@ WP4 已以 MODELLED fixtures 完成離線整合並通過作者測試 104/104；W
 - **workflow 失敗窗口**：admission 已 commit 而 workflow 丟錯時，receipt 會留下但沒有 result；重試 fail closed。此為 exactly-once 取捨，WP5 前需決定補償策略。
 - **待決（不實作）**：gateway 執行檔身分、Keychain 專用 helper／ACL；HD3 仍 BLOCKED。
 
-## 2. 方案 B — r1 修正與原地部署草稿（2026-10-23）
+## 2. 方案 B — r2 M1／M2 修正與原地部署草稿（2026-10-23）
 
 ### 候選與狀態
-- 作者／owner：Codex；worktree `c1-planB/`；分支 `codex/c1-planB-20261022`；程式候選 commit `09b6950b3a9630d1ee956d6ee9c4b3be973926b7`。
-- 父 commit `7ae103ee3452db7dd78ec214c7c94b8772cb5cc4`；方案 A 基準 `b6e7d10e8b04fd10e7a1d72563a40c343a11181e`。
+- 作者／owner：Codex；worktree `c1-planB/`；分支 `codex/c1-planB-20261022`；程式候選 commit `50606383a8b3d7676a347f51fd5a2aee9099264d`。
+- 本輪父 commit `7b70af9913c863aef47538de69615b8bdff78f4b`；方案 A 基準 `b6e7d10e8b04fd10e7a1d72563a40c343a11181e`。r2 報告記錄的是較早的未 commit 狀態，本輪以實際 Git 狀態為準。
 - F3：C1 identity＋planned marker＋`SIGTERM` 或 watcher 的 `None` 均要求 exit 75；SIGINT、takeover、其他 label 保留原行為。
-- F1：`HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME=1` **且** HOME resolve 後嚴格位於 `/tmp`（macOS `/private/tmp`）底下，才略過啟動防呆；TMPDIR 不決定這個邊界。
+- F1／M1：`HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME=1` **且** HOME resolve 後嚴格位於 `Path(tempfile.gettempdir()).resolve()` 或 `/private/tmp` 解析後的路徑底下，才略過啟動防呆；排除該根目錄本身與 symlink 逃逸，接受 macOS 預設 TMPDIR。
 - real-boot 子程序明確設定該旗標；未替換 guard。其他情境仍要求 ppid=1 與 c1-runtime code root，拒絕 78；C1 label 下拒絕映射 0。
 - 本輪只執行經授權的既有 Python；另經 Human 明確例外允許 local commit 寫入共用 `.git` 必要 metadata，未修改 runtime 工作目錄或其他 ref；live 部署、plist 修改、gateway 操作均 NOT_EXECUTED。
 
-### 作者驗證
-- 基準 regression：未修改的 production `7ae103e`＋新測試，2 個預期失敗（F1／F3）、3 passed；證據 `/private/tmp/c1-planB-r2.fQcHg2/red.log`、`red.xml`。
-- r1 §6 全部 18 檔（含新增 10 案例）：**569 passed／37 skipped／0 failed**；另 real-boot 所在檔：**7 passed／1 skipped／0 failed**；總計 **576／38／0**。
-- 直譯器：`/Users/kudi68-15mba/Projects/c1-runtime/hermes-agent-c1-fe6ab90/.venv/runtime/bin/python`；pytest 9.1.1；import 已確認來自 planB。
-- 依本次明確指示採 r1 §6 直接 pytest（覆蓋 repo 的 runner 慣例）；`env -i`、PYTHONPATH=planB、HOME／HERMES_HOME／TMPDIR 都在 `/private/tmp/c1-planB-r2.fQcHg2/`，`-B -p no:cacheprovider`。
-- 首輪 `suite.log`／`suite.xml`：567 passed／38 skipped／9 failed；9 個失敗有 socket／ps 程序查詢 sandbox 拒絕證據。經核准只在 sandbox 外重跑這 9 個，`retry.log`／`retry.xml` 為 9 passed，未重跑其餘已 PASS 案例。
-- 以 JUnit 的 classname＋name 核對 retry 集合恰等於首輪失敗集合，去重後得到上述總數。37 個平台 skip；缺 `HERMES_TEST_C1_AGENT_OPS_REPO`／`HERMES_TEST_C1_SOURCE_REPO` 的 real-boot 為 **SKIPPED_NEEDS_ENV**，不算通過。
-- 回滾 script 僅 `bash -n` 靜態語法驗證，未執行；live Stop／Telegram 仍 UNPROVEN。
-- quota preflight：Codex 5h 5%／7d 1%；收尾 5h 9%／7d 1%，均低於 85%。本包未委派；預估同類局部修正額外不超過 15pp，START_NOW。
+### 作者驗證（本輪 delta）
+- 未修 production `7b70af9`＋新測試：4 個預期失敗、3 passed，確實攔下 macOS TMPDIR 拒絕、已卸載回滾中止、缺 PID／ppid、先換碼才遇 bootout 權限錯誤；證據 `/private/tmp/c1-planB-r3.gwnnRz/red.log`、`red.xml`。
+- 修正後：**15 passed／0 skipped／0 failed**。`tests/hermes_cli/test_c1_runtime_launch_guard.py` 12 案例、`tests/scripts/test_c1_planb_rollback.py` 3 案例；證據 `/private/tmp/c1-planB-r3.gwnnRz/green.log`、`green.xml`。
+- macOS `/private/var/folders/…/T` 路徑由 monkeypatch 提供，含子目錄放行、根目錄／同前綴 sibling 拒絕、`/private/tmp` fallback；屬單元證據，不代表 real-boot。
+- 回滾測試以假的 launchctl 函式涵蓋「已卸載」「仍載入」，兩者均 bootstrap 一次並印出 PID／ppid；另驗未預期的權限錯誤不被吞掉、也不 checkout。
+- harness 把 git／檔案操作／ps 等全部替換為 shell 函式，PATH=/nonexistent，未執行真 launchctl 或讀寫 live plist／runtime 工作目錄。`bash -n scripts/c1-planB-rollback.sh` PASS；實際回滾 NOT_EXECUTED。
+- 直譯器：`/Users/kudi68-15mba/Projects/c1-runtime/hermes-agent-c1-fe6ab90/.venv/runtime/bin/python`；import 已確認來自 planB。依本次指示採直接 pytest：`env -i`、PYTHONPATH=planB、HOME／HERMES_HOME／TMPDIR 在 `/private/tmp/c1-planB-r3.gwnnRz/`，`-B -p no:cacheprovider`。
+- real-boot **未執行，SKIPPED_NEEDS_ENV**，不列入本輪 pytest 的 skipped 數，也不宣稱通過。
+- 上一輪歷史結果（本輪未重跑）：18 檔 569 passed／37 skipped；加 real-boot 所在檔共 576 passed／38 skipped／0 failed。原證據 `/private/tmp/c1-planB-r2.fQcHg2/` 的 suite／retry log 與 XML；當時 9 個 sandbox 失敗只重跑該 9 個並通過。
+- 本輪 quota preflight：Codex 5h 14%／7d 2%，低於 85%；估計局部 delta 額外不超過 10pp，START_NOW。未委派。
 
 ### 原地部署草稿 — 全部 NOT_EXECUTED，須另取得 live 授權
 固定使用原 `hermes-agent-c1-fe6ab90` checkout／既有 launcher；不新增 checkout／venv。以下在同一 bash session 逐段執行，任一步失敗就停。禁止 `reset --hard`、`clean`，保留所有 untracked 檔。
@@ -78,7 +79,7 @@ NIGHT=/Users/kudi68-15mba/Projects/night/20261022
 ROOT=/Users/kudi68-15mba/Projects/c1-runtime/hermes-agent-c1-fe6ab90
 PLIST=/Users/kudi68-15mba/Library/LaunchAgents/local.hermes.c1-chief.plist
 PLIST_A="$NIGHT/plist-A/local.hermes.c1-chief.plist"
-NEW_COMMIT=09b6950b3a9630d1ee956d6ee9c4b3be973926b7
+NEW_COMMIT=50606383a8b3d7676a347f51fd5a2aee9099264d
 BASE=b6e7d10e8b04fd10e7a1d72563a40c343a11181e
 LABEL=local.hermes.c1-chief
 DOMAIN="gui/$(id -u)"
@@ -140,18 +141,19 @@ pgrep -l python
 ### 單一回滾 script 草稿 — NOT_EXECUTED
 - 檔案：`c1-planB/scripts/c1-planB-rollback.sh`。部署前必須已產生上面的 `plist-A/local.hermes.c1-chief.plist.sha256`；script 先驗 SHA／plist 格式與 tracked worktree 無變更。
 - 另取得回滾授權後，單一入口：`bash /Users/kudi68-15mba/Projects/night/20261022/c1-planB/scripts/c1-planB-rollback.sh`。
-- script 依序 `checkout --detach b6e7d10…` → 還原 plist-A → `launchctl bootout` → `launchctl bootstrap`。保留 untracked；任何命令失敗就停，不重試未知結果。
-- 回滾後 HEAD detached 在方案 A；`feat/c1-wiring` 保留新 commit，不移動分支、不刪候選。重新核對 launcher、PID／ppid=1、job 與 Telegram 回覆；bootout 失敗不得視作已回滾。
+- M2：preflight 後先 `launchctl bootout`，成功或回覆 `"No such process"`／`"Could not find service"` 時繼續；其他錯誤立即停下。再 `checkout --detach b6e7d10…` → 還原 plist-A → **一定執行 bootstrap**（前置步驟皆成功時），保留 untracked。
+- 最後以 `launchctl print` 最多 35 次／間隔 1 秒等 PID，印 job 狀態及 `ps -o pid,ppid,comm -p <PID>`；逾時 exit 1，不當成功。
+- 回滾後 HEAD detached 在方案 A；`feat/c1-wiring` 保留新 commit，不移動分支、不刪候選。仍須確認 launcher、ppid=1、job 與 Telegram；fake 測試不等於實際回滾 PASS。
 
 ### 殘留風險
 - **F6**：guard 作用於此 c1 build 的所有 profile／run_gateway 路徑，foreground fallback、idle-exit 自動啟動仍被拒；有 C1 label 的永久拒絕會 exit 0 並 park。不得 upstream 或套到需要手動 gateway 的分支。
-- **F7**：這是同一使用者下的防呆，不是安全邊界。double-fork／reparent、runtime 內其他副本、HOME／symlink 可影響判斷；測試 opt-out 亦不提供對同一使用者的隔離保證。
+- **F7**：這是同一使用者下的防呆，不是安全邊界。double-fork／reparent、runtime 內其他副本、HOME／symlink 可影響判斷；TMPDIR 亦會影響測試 opt-out 的暫存根，不提供對同一使用者的隔離保證。
 - **F8**：SIGINT 與 `--replace` takeover 保留 exit 0；chief 可能停著。stock takeover 已取得鎖，單改 75 也無法保證搶回，本輪不擴修。
 - wrapper 會使 ppid 非 1；新 plist 必須維持直接 launcher。F2 的顯式 label 只有草稿，live identity 尚未驗證。
 - stop→restart 仍是原本立即 stop，不新增 after-turn drain。real-boot、live Stop、Telegram、實際部署／回滾皆無本輪 PASS。
 
 ## 3. 本輪續作狀態
-- 程式、測試與回滾 script 已 PERSISTED 至 local commit `09b6950b3a9630d1ee956d6ee9c4b3be973926b7`；分支 `codex/c1-planB-20261022`，父 commit `7ae103e`。未同步／push／merge／開 PR。
-- 依 Human 指定再用獨立 docs commit 保存本報告的 repo 根目錄快照 `c1-planB/NIGHT-REPORT-WP4.md`；原夜班路徑保存相同內容的 LOCAL_ONLY 副本，不另建 state／handoff。部署固定上述已測程式 SHA，後續 docs commit 只新增報告。
-- VERIFIED：F1／F3 回歸、測試數字、script／部署草稿語法與 diff whitespace；SKIPPED_NEEDS_ENV：real-boot；NOT_EXECUTED：部署、回滾、live Stop、Telegram。Git metadata 授權阻礙已解除。
-- 唯一下一步：Claude Code fresh review r2，讀 r1、程式候選 diff、文件 commit 與本輪證據，寫到 `/Users/kudi68-15mba/Projects/night/20261022/c1-planB-review-r2.md`；該報告留給 reviewer，本輪不建立。Human 目前無需操作；完成後先 `/clear`。
+- 本輪 M1／M2、測試與回滾 script 已 PERSISTED 至 local commit `50606383a8b3d7676a347f51fd5a2aee9099264d`；分支 `codex/c1-planB-20261022`，父 commit `7b70af9`。未同步／push／merge／開 PR。
+- 依 Human 指定再用獨立 docs commit 保存本報告 `c1-planB/NIGHT-REPORT-WP4.md`；原夜班路徑保存相同內容的 LOCAL_ONLY 副本，不另建 state／handoff。部署固定上述程式 SHA，後續 docs commit 只更新報告。
+- VERIFIED：本輪 15 個 delta 測試、fake 回滾兩狀態與 bash 語法；SKIPPED_NEEDS_ENV：real-boot 未跑；NOT_EXECUTED：部署、真實回滾、live Stop、Telegram。UNKNOWN：實際環境行為，須另取得 live 授權。
+- 唯一下一步：Claude Code fresh review 本次 M1／M2 delta、候選 commit 與證據；Human 目前無需操作。獨立審查報告留給 reviewer，本輪不建立。完成後先 `/clear`。
