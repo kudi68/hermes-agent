@@ -185,7 +185,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
         elif planned_stop_seen[0] and not planned_takeover:
             planned_stop = True
         from gateway.restart import is_c1_chief_launchd_job
-        launchd_restart = (received_signal == signal.SIGTERM and planned_stop and is_c1_chief_launchd_job())
+        launchd_restart = (received_signal in (signal.SIGTERM, None) and planned_stop and is_c1_chief_launchd_job())
         if launchd_restart:
             planned_stop_seen[0] = False
             planned_stop = False
@@ -195,7 +195,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
         if launchd_restart:
-            logger.info("Received a planned external SIGTERM — the C1 launchd job will restart after shutdown")
+            logger.info("Received a planned external stop — the C1 launchd job will restart after shutdown")
         elif planned_takeover:
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
         elif planned_stop:

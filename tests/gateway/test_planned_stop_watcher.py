@@ -14,6 +14,7 @@ See issue #33778 for the original Windows session-loss bug report.
 import asyncio
 import json
 import os
+import signal
 import threading
 import time
 from unittest.mock import MagicMock
@@ -278,6 +279,57 @@ def test_c1_launchd_external_planned_stop_exits_75(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         run_mod._resolve_gateway_exit_verdict(runner, flag[0])
     assert exc.value.code == 75
+
+
+def test_c1_launchd_watcher_only_planned_stop_exits_75(tmp_path, monkeypatch):
+    """A real watcher callback must restart C1 even when the CLI never sends SIGTERM."""
+    consume_marker = status_mod.consume_planned_stop_marker_for_self
+    run_mod, runner, flag, handler = _launchd_signal_handler(monkeypatch, planned_stop=True)
+    monkeypatch.setattr(status_mod, "consume_planned_stop_marker_for_self", consume_marker)
+    marker = tmp_path / ".gateway-planned-stop.json"
+    monkeypatch.setattr(status_mod, "_get_planned_stop_marker_path", lambda: marker)
+    _write_self_marker(marker)
+    runner._running = True
+    runner._draining = False
+    loop = _make_loop_capturing_calls()
+
+    _run_planned_stop_watcher(threading.Event(), runner, loop, handler, poll_interval=0.01)
+    callback, args = loop._captured[0]
+    assert args == (None,)
+    callback(*args)
+
+    assert not marker.exists()
+    assert flag[0] is False
+    assert runner._restart_via_service is True
+    with pytest.raises(SystemExit) as exc:
+        run_mod._resolve_gateway_exit_verdict(runner, flag[0])
+    assert exc.value.code == 75
+
+
+@pytest.mark.parametrize("received_signal", [None, signal.SIGTERM])
+def test_non_c1_label_keeps_clean_planned_stop(monkeypatch, received_signal):
+    run_mod, runner, flag, handler = _launchd_signal_handler(monkeypatch, planned_stop=True)
+    monkeypatch.setenv("XPC_SERVICE_NAME", "ai.hermes.gateway")
+    monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
+    handler(received_signal)
+
+    assert flag[0] is False
+    assert runner._restart_requested is False
+    assert runner._restart_via_service is False
+    assert run_mod._resolve_gateway_exit_verdict(runner, flag[0]) is True
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+def test_c1_sigint_and_takeover_keep_clean_exit(monkeypatch, takeover):
+    import signal
+
+    run_mod, runner, flag, handler = _launchd_signal_handler(monkeypatch, planned_stop=True)
+    monkeypatch.setattr(status_mod, "consume_takeover_marker_for_self", lambda: takeover)
+    handler(signal.SIGTERM if takeover else signal.SIGINT)
+
+    assert flag[0] is False
+    assert runner._restart_via_service is False
+    assert run_mod._resolve_gateway_exit_verdict(runner, flag[0]) is True
 
 
 def test_c1_launchd_unmarked_sigterm_keeps_normal_stop_classification(monkeypatch):

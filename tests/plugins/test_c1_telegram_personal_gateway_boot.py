@@ -86,7 +86,7 @@ def test_real_gateway_boot_writes_binding_marker_for_its_own_pid(tmp_path):
     source_repo = os.environ.get("HERMES_TEST_C1_SOURCE_REPO")
     if not agent_ops_repo or not source_repo:
         pytest.skip(
-            "set HERMES_TEST_C1_AGENT_OPS_REPO and "
+            "SKIPPED_NEEDS_ENV: set HERMES_TEST_C1_AGENT_OPS_REPO and "
             "HERMES_TEST_C1_SOURCE_REPO to isolated checkouts"
         )
     hermes_repo = Path(__file__).resolve().parents[2]
@@ -130,6 +130,8 @@ def test_real_gateway_boot_writes_binding_marker_for_its_own_pid(tmp_path):
         "HERMES_GATEWAY_LOCK_DIR": str(home / "state" / "locks"),
         "HERMES_DISABLE_LAZY_INSTALLS": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
+        # The production guard stays enabled; only this tmp-HOME child may opt out.
+        "HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME": "1",
         # The child's HERMES_HOME is this test's tmp_path, not a live install.
         "HERMES_STATE_DB_GUARD_BYPASS": "1",
         "HTTPS_PROXY": blackhole,

@@ -269,6 +269,15 @@ def _c1_runtime_launch_refusal_reason(
     *, parent_pid: int | None = None, project_root: Path | None = None, runtime_root: Path | None = None,
 ) -> str | None:
     """Require the C1 gateway code to run as a launchd child from the c1-runtime checkout."""
+    # Isolated real-boot tests are children of pytest, outside the live runtime tree.
+    if os.environ.get("HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME") == "1" and os.environ.get("HOME"):
+        try:
+            test_home = Path(os.environ["HOME"]).resolve()
+            tmp_root = Path("/tmp").resolve()
+            if test_home != tmp_root and test_home.is_relative_to(tmp_root):
+                return None
+        except (OSError, RuntimeError, ValueError):
+            pass  # An unresolvable HOME must still pass the normal launch checks.
     parent_pid = os.getppid() if parent_pid is None else parent_pid
     project_root = PROJECT_ROOT if project_root is None else Path(project_root)
     runtime_root = Path.home() / "Projects" / "c1-runtime" if runtime_root is None else Path(runtime_root)

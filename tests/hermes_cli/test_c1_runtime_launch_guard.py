@@ -1,6 +1,7 @@
 """C1 chief startup is limited to the launchd-owned c1-runtime checkout."""
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -64,3 +65,34 @@ def test_launchd_identity_parks_a_refused_start_instead_of_restart_looping(tmp_p
 
     assert exc.value.code == 0
     assert "not launchd" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("enabled", "temporary_home", "allowed"),
+    [("1", True, True), (None, True, False), ("1", False, False), ("0", True, False)],
+)
+def test_test_only_opt_out_requires_flag_and_tmp_home(
+    tmp_path, monkeypatch, enabled, temporary_home, allowed,
+):
+    """Neither the explicit test flag nor a temporary HOME alone bypasses the guard."""
+    flag = "HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME"
+    if enabled is None:
+        monkeypatch.delenv(flag, raising=False)
+    else:
+        monkeypatch.setenv(flag, enabled)
+    home = tmp_path / "home" if temporary_home else Path("/Users/c1-test-outside-tmp")
+    monkeypatch.setenv("HOME", str(home))
+    reason = gateway._c1_runtime_launch_refusal_reason(
+        parent_pid=42, project_root=tmp_path / "outside-runtime",
+    )
+    assert (reason is None) is allowed
+    if not allowed:
+        assert "not launchd" in reason
+
+
+def test_test_only_opt_out_rejects_home_symlink_outside_tmp(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME", "1")
+    home = tmp_path / "home"
+    home.symlink_to(Path("/Users"), target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert gateway._c1_runtime_launch_refusal_reason(parent_pid=42) is not None
