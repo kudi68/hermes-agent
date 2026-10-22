@@ -39,6 +39,7 @@ EXTERNAL_GATEWAY_SUPERVISOR_ENV = "HERMES_GATEWAY_EXTERNAL_SUPERVISOR"
 # Forwarded by the stderr-timestamp launchd wrapper (hermes_cli/stderr_timestamp.py) to the gateway
 # grandchild, which sees ``XPC_SERVICE_NAME=0``. Read only via :func:`launchd_job_label`.
 LAUNCHD_LABEL_ENV = "HERMES_LAUNCHD_LABEL"
+C1_CHIEF_LAUNCHD_LABEL = "local.hermes.c1-chief"
 
 DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["restart_drain_timeout"])
 DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT = float(DEFAULT_CONFIG["gateway"]["signal_interrupt_grace_timeout"])
@@ -105,6 +106,13 @@ def launchd_job_label(environ: Mapping[str, str] | None = None) -> str | None:
         if label.startswith("ai.hermes"):
             return label
     return None
+
+
+def is_c1_chief_launchd_job(environ: Mapping[str, str] | None = None) -> bool:
+    """True only for the dedicated C1 chief LaunchAgent, including its forwarded wrapper label."""
+    env = os.environ if environ is None else environ
+    return any(env.get(name) == C1_CHIEF_LAUNCHD_LABEL
+               for name in ("XPC_SERVICE_NAME", LAUNCHD_LABEL_ENV))
 
 
 def launchd_service_label(environ: Mapping[str, str] | None = None, *, platform: str = sys.platform) -> str | None:
