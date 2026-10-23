@@ -1090,6 +1090,27 @@ class GatewayStartupMixin:
             logger.warning("relay adapter registration failed at gateway startup", exc_info=True)
         GatewayStartupMixin._register_launch_profile_config_hooks()
 
+    def _start_require_c1_binding_ready(self) -> bool:
+        """Fail startup when enabled chief C1 never registered its effect-gated callback."""
+        from gateway.run_inbound_consumer import c1_binding_startup_error
+
+        try:
+            error = c1_binding_startup_error()
+        except Exception as exc:
+            error = (
+                "C1 Telegram binding readiness check failed "
+                "(loaded.error=UNKNOWN, HEAD=UNKNOWN, expected_pin=UNKNOWN, "
+                f"callback_count=UNKNOWN, check_error={type(exc).__name__}: {exc})"
+            )
+            logger.exception("%s", error)
+            self._startup_fail_fatal_config(error)
+            return False
+        if error is None:
+            return True
+        logger.error("%s", error)
+        self._startup_fail_fatal_config(error)
+        return False
+
     @staticmethod
     def _register_launch_profile_config_hooks() -> None:
         """The launch profile's ``hooks:`` block, registered under ITS runtime scope when multiplexing.
@@ -1150,6 +1171,8 @@ class GatewayStartupMixin:
         """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
         from gateway.run import _hermes_home
         self._start_register_plugins_relay_hooks()
+        if not self._start_require_c1_binding_ready():
+            return
         # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
         with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
             from hermes_cli.plugins import get_plugin_manager
@@ -1643,6 +1666,8 @@ class GatewayStartupMixin:
         if self._start_check_access_policy():
             return True
         await self._start_recover_previous_run()
+        if await self._abort_startup_if_shutdown_requested():
+            return True
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
         self._startup_restore_in_progress = True

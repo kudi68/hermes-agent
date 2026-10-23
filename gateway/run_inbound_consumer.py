@@ -386,6 +386,68 @@ def _c1_binding_callback():
     return callback
 
 
+def _c1_enabled_settings() -> dict | None:
+    """Return the configured C1 settings only when the chief plugin is explicitly enabled."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.plugins_discovery import _get_disabled_plugins, _get_enabled_plugins
+    from hermes_cli.plugins_state import _plugin_settings_entry
+    from hermes_constants import get_hermes_home, profile_name_for_home
+
+    if profile_name_for_home(get_hermes_home()) != C1_TELEGRAM_PROFILE:
+        return None
+    enabled = _get_enabled_plugins()
+    if enabled is None or C1_TELEGRAM_PLUGIN not in enabled:
+        return None
+    if C1_TELEGRAM_PLUGIN in _get_disabled_plugins():
+        return None
+    entry = _plugin_settings_entry(load_config_readonly() or {}, C1_TELEGRAM_PLUGIN)
+    if not isinstance(entry, dict):
+        return None
+    settings = entry.get("settings")
+    if not isinstance(settings, dict):
+        settings = entry.get("config")
+    if not isinstance(settings, dict) or settings.get("enabled") is not True:
+        return None
+    return settings
+
+
+def _c1_expected_gateway_pin(loaded: Any, settings: dict) -> str:
+    """Read the agent-ops gate value through the bundled plugin's validated loader."""
+    module = getattr(loaded, "module", None)
+    load_modules = getattr(module, "_agent_ops_modules", None)
+    if not callable(load_modules):
+        return "UNKNOWN"
+    try:
+        _production, operator_ops = load_modules(settings.get("agent_ops_repo"))
+        value = getattr(operator_ops, "_HERMES_PIN", None)
+    except Exception:
+        logger.debug("Could not read the C1 Hermes pin for startup diagnostics.", exc_info=True)
+        return "UNKNOWN"
+    return value if type(value) is str and value else "UNKNOWN"
+
+
+def c1_binding_startup_error() -> str | None:
+    """Describe the fail-closed startup condition for an enabled but unbound chief C1."""
+    settings = _c1_enabled_settings()
+    if settings is None or _c1_binding_callback() is not None:
+        return None
+
+    from gateway.code_skew import current_code_sha
+    from hermes_cli.plugins import get_plugin_manager, iter_hook_callbacks
+
+    manager = get_plugin_manager()
+    loaded = manager._plugins.get(C1_TELEGRAM_PLUGIN)
+    loaded_error = getattr(loaded, "error", None)
+    callback_count = len(iter_hook_callbacks(POST_ADMISSION_HOOK))
+    head = current_code_sha() or "UNKNOWN"
+    expected_pin = _c1_expected_gateway_pin(loaded, settings)
+    return (
+        "C1 Telegram is enabled but its binding callback is unavailable "
+        f"(loaded.error={loaded_error!r}, HEAD={head}, expected_pin={expected_pin}, "
+        f"callback_count={callback_count})"
+    )
+
+
 def _invoke_c1_binding(callback, payload):
     from hermes_cli.plugins_dispatch import PluginDispatchMixin
 

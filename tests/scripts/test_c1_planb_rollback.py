@@ -37,13 +37,58 @@ launchctl() {
         return 1
       fi
       ;;
-    print) printf 'gui/501/local.hermes.c1-chief = {\n\tpid = 4242\n}\n' ;;
+    print)
+      print_count=0
+      while IFS= read -r recorded; do
+        case "$recorded" in
+          "launchctl print "*) print_count=$((print_count + 1)) ;;
+        esac
+      done < "$calls"
+      case "$scenario" in
+        loaded)
+          if [ "$print_count" -eq 1 ]; then
+            record "print-result loaded"
+            printf 'gui/501/local.hermes.c1-chief = {\n\tstate = running\n}\n'
+          elif [ "$print_count" -eq 2 ]; then
+            record "print-result unloaded"
+            printf 'Could not find service "local.hermes.c1-chief" in domain for user gui: 501\n' >&2
+            return 113
+          else
+            record "print-result pid"
+            printf 'gui/501/local.hermes.c1-chief = {\n\tpid = 4242\n}\n'
+          fi
+          ;;
+        unloaded)
+          if [ "$print_count" -eq 1 ]; then
+            record "print-result unloaded"
+            printf 'Could not find service "local.hermes.c1-chief" in domain for user gui: 501\n' >&2
+            return 113
+          else
+            record "print-result pid"
+            printf 'gui/501/local.hermes.c1-chief = {\n\tpid = 4242\n}\n'
+          fi
+          ;;
+        print_denied)
+          printf 'Could not read service: Operation not permitted\n' >&2
+          return 1
+          ;;
+        wrong_service_not_found)
+          printf 'Could not find service "other.service" in domain for user gui: 501\n' >&2
+          return 113
+          ;;
+        still_loaded)
+          record "print-result loaded"
+          printf 'gui/501/local.hermes.c1-chief = {\n\tstate = running\n}\n'
+          ;;
+      esac
+      ;;
   esac
 }
-ps() {
-  record "ps $*"
-  printf '  PID  PPID COMM\n 4242     1 fake-chief\n'
+pgrep() {
+  record "pgrep $*"
+  printf '4242 fake-chief\n'
 }
+print_count=0
 source "$script"
 """
 
@@ -58,18 +103,34 @@ def _run_rollback(tmp_path, scenario):
         # Every external action must have a fake function, or fail instead of reaching the host.
         env={"PATH": "/nonexistent"},
         capture_output=True, text=True, timeout=10,
+        check=False,
     )
     return result, calls.read_text().splitlines()
 
 
 @pytest.mark.parametrize("scenario", ["unloaded", "loaded"])
-def test_rollback_bootstraps_and_prints_pid_for_both_job_states(tmp_path, scenario):
+def test_rollback_waits_for_unload_then_bootstraps_and_prints_pid(tmp_path, scenario):
     result, calls = _run_rollback(tmp_path, scenario)
     assert result.returncode == 0, result.stdout + result.stderr
+
+    bootout = next(i for i, call in enumerate(calls) if call.startswith("launchctl bootout "))
+    checkout = next(i for i, call in enumerate(calls) if call.startswith("git -C ") and " checkout " in call)
+    bootstrap = next(i for i, call in enumerate(calls) if call.startswith("launchctl bootstrap "))
+    assert bootout < checkout < bootstrap
+
+    if scenario == "loaded":
+        loaded = calls.index("print-result loaded")
+        unloaded = calls.index("print-result unloaded")
+        assert bootout < loaded < unloaded < checkout < bootstrap
+    else:
+        unloaded = calls.index("print-result unloaded")
+        assert bootout < unloaded < checkout < bootstrap
+
     assert calls.count("launchctl bootstrap gui/501 /Users/kudi68-15mba/Library/LaunchAgents/local.hermes.c1-chief.plist") == 1
     assert "launchctl print gui/501/local.hermes.c1-chief" in calls
-    assert "ps -o pid,ppid,comm -p 4242" in calls
-    assert "4242     1 fake-chief" in result.stdout
+    assert calls.index("print-result pid") > bootstrap
+    assert "pgrep -l ." in calls
+    assert "4242 fake-chief" in result.stdout
 
 
 def test_rollback_does_not_hide_unexpected_bootout_failure(tmp_path):
@@ -78,3 +139,29 @@ def test_rollback_does_not_hide_unexpected_bootout_failure(tmp_path):
     assert not any(call.startswith("launchctl bootstrap ") for call in calls)
     assert not any(" checkout " in call for call in calls)
     assert "Operation not permitted" in result.stderr
+
+
+def test_rollback_stops_on_unexpected_print_error(tmp_path):
+    result, calls = _run_rollback(tmp_path, "print_denied")
+    assert result.returncode != 0
+    assert "Could not read service: Operation not permitted" in result.stderr
+    assert not any(call.startswith("launchctl bootstrap ") for call in calls)
+    assert not any(" checkout " in call for call in calls)
+
+
+def test_rollback_does_not_treat_another_service_as_unloaded(tmp_path):
+    result, calls = _run_rollback(tmp_path, "wrong_service_not_found")
+    assert result.returncode != 0
+    assert not any(call.startswith("launchctl bootstrap ") for call in calls)
+    assert not any(" checkout " in call for call in calls)
+    assert 'Could not find service "other.service"' in result.stderr
+
+
+def test_rollback_times_out_while_job_remains_loaded(tmp_path):
+    result, calls = _run_rollback(tmp_path, "still_loaded")
+    assert result.returncode != 0
+    assert "remained loaded for 35 checks" in result.stderr
+    assert calls.count("launchctl print gui/501/local.hermes.c1-chief") == 35
+    assert calls.count("sleep 1") == 34
+    assert not any(call.startswith("launchctl bootstrap ") for call in calls)
+    assert not any(" checkout " in call for call in calls)
