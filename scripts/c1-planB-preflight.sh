@@ -58,12 +58,12 @@ check_runtime() {
     exit 1
   fi
   # Ignored code can also shadow imports. Bytecode caches do not block switching.
-  ignored=$(git -C "$repo" -c core.fsmonitor=false status --porcelain=v1 \
-    --untracked-files=all --ignored=matching -- \
+  # Not `status --ignored`: with exclude pathspecs it lists ignored root dirs (.venv/).
+  ignored=$(git -C "$repo" ls-files --others --ignored --exclude-standard -- \
     gateway hermes_cli hermes_constants.py plugins/c1_telegram_personal plugins/platforms/telegram tools \
     ':(exclude,glob)**/__pycache__' ':(exclude,glob)**/__pycache__/**')
   if [ -n "$ignored" ]; then
-    printf 'FAIL runtime %s has untracked or ignored protected files:\n%s\n' "$repo" "$ignored" >&2
+    printf 'FAIL runtime %s has ignored protected files:\n%s\n' "$repo" "$ignored" >&2
     exit 1
   fi
   printf 'PASS runtime %s HEAD=%s target=%s\n' "$repo" "$actual_head" "$target_head"

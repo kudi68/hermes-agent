@@ -38,10 +38,10 @@ git() {
         "$role-tracked") printf ' M gateway/core.py\n' ;;
         "$role-index") printf 'M  gateway/core.py\n' ;;
         "$role-untracked") printf '?? gateway/injected.py\n' ;;
-        "$role-ignored")
-          case "$*" in *--ignored=matching*) printf '!! gateway/ignored.py\n' ;; esac
-          ;;
       esac
+      ;;
+    *" ls-files --others --ignored "*)
+      if [ "$scenario" = "$role-ignored" ]; then printf 'gateway/ignored.py\n'; fi
       ;;
   esac
 }
@@ -114,6 +114,7 @@ def test_preflight_runs_pin_check_then_operator_preflight_without_launchd(tmp_pa
         assert max(runtime_checks) < pin
         assert all(
             "rev-parse --verify" in calls[i] or " status " in calls[i]
+            or " ls-files " in calls[i]
             for i in runtime_checks
         )
     assert not any(call.startswith("launchctl ") for call in calls)
@@ -177,7 +178,13 @@ def test_preflight_requires_exact_candidate_revisions(tmp_path):
     assert not calls.exists()
 
 
-@pytest.mark.parametrize("fault", ["clean", "tracked", "index", "untracked", "ignored", "ops-ignored"])
+RUNTIME_GATE_PASSES = ("clean", "root-ignored", "pycache")
+
+
+@pytest.mark.parametrize("fault", [
+    *RUNTIME_GATE_PASSES, "tracked", "index", "untracked", "ignored", "ops-ignored",
+    "protected-ignored-dir",
+])
 def test_runtime_gate_with_real_temporary_checkouts(tmp_path, fault):
     runtime = tmp_path / "runtime"
     ops_runtime = tmp_path / "ops-runtime"
@@ -192,7 +199,10 @@ def test_runtime_gate_with_real_temporary_checkouts(tmp_path, fault):
     git(runtime, "init", "-q")
     (runtime / "gateway").mkdir()
     (runtime / "gateway/core.py").write_text("PINNED = True\n")
-    (runtime / ".gitignore").write_text("gateway/ignored.py\ntools/agent_ops_c1/ignored.py\n")
+    (runtime / ".gitignore").write_text(
+        "gateway/ignored.py\ntools/agent_ops_c1/ignored.py\n"
+        ".venv/\n.pytest_cache/\n__pycache__/\nplugins/platforms/telegram/vendor/\n"
+    )
     git(runtime, "add", "--", ".gitignore", "gateway/core.py")
     git(runtime, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
         "commit", "-qm", "runtime fixture")
@@ -208,6 +218,17 @@ def test_runtime_gate_with_real_temporary_checkouts(tmp_path, fault):
     elif fault == "ops-ignored":
         (ops_runtime / "tools/agent_ops_c1").mkdir(parents=True)
         (ops_runtime / "tools/agent_ops_c1/ignored.py").write_text("INJECTED = True\n")
+    elif fault == "root-ignored":
+        # Ignored state outside the protected import paths must not block the gate.
+        for name in (".venv/bin", ".pytest_cache/v"):
+            (runtime / name).mkdir(parents=True)
+            (runtime / name / "marker").write_text("local\n")
+    elif fault == "pycache":
+        (runtime / "gateway/__pycache__").mkdir()
+        (runtime / "gateway/__pycache__/core.cpython-311.pyc").write_bytes(b"\0")
+    elif fault == "protected-ignored-dir":
+        (runtime / "plugins/platforms/telegram/vendor").mkdir(parents=True)
+        (runtime / "plugins/platforms/telegram/vendor/shadow.py").write_text("INJECTED = True\n")
     script = Path(__file__).resolve().parents[2] / "scripts/c1-planB-preflight.sh"
     result = subprocess.run(
         ["/bin/bash", "--noprofile", "--norc", "-c",
@@ -224,6 +245,6 @@ def test_runtime_gate_with_real_temporary_checkouts(tmp_path, fault):
         },
         capture_output=True, text=True, timeout=15, check=False,
     )
-    assert (result.returncode == 0) is (fault == "clean"), result.stdout + result.stderr
+    assert (result.returncode == 0) is (fault in RUNTIME_GATE_PASSES), result.stdout + result.stderr
     assert git(runtime, "rev-parse", "HEAD") == sha
     assert git(ops_runtime, "rev-parse", "HEAD") == sha
