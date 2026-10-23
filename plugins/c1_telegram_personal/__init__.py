@@ -18,7 +18,7 @@ from hermes_constants import get_hermes_home
 
 PLUGIN_ID = "c1_telegram_personal"
 HOOK_NAME = "post_gateway_admission"
-GATEWAY_PIN = "dec92d244a0282b28552ae2d4ba284ac2c0920af"
+GATEWAY_PIN = "cd44e440626064ede230eb06489533df63f1b3ba"
 _BOT_TOKEN = re.compile(r"[0-9]+:[A-Za-z0-9_-]{30,}\Z")
 _OWNER_ID = re.compile(r"[1-9][0-9]{0,19}\Z")
 logger = logging.getLogger(__name__)
