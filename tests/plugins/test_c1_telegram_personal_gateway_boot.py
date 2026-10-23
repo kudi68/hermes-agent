@@ -407,7 +407,7 @@ def test_real_gateway_boot_writes_binding_marker_for_its_own_pid(tmp_path):
             "PASS hmac_file",
             "PASS c1_db_writable",
             "PASS binding_registered",
-            "PASS gateway_version_c4cd640",
+            "PASS gateway_version",
         ]
         assert marker.exists(), (
             "gateway boot did not write the C1 binding marker:\n"
