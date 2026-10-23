@@ -390,7 +390,7 @@ def _c1_enabled_settings() -> dict | None:
     """Return the configured C1 settings only when the chief plugin is explicitly enabled."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.plugins_discovery import _get_disabled_plugins, _get_enabled_plugins
-    from hermes_cli.plugins_state import _plugin_settings_entry
+    from hermes_cli.plugins_state import _nested_plugin_value, _plugin_settings_entry
     from hermes_constants import get_hermes_home, profile_name_for_home
 
     if profile_name_for_home(get_hermes_home()) != C1_TELEGRAM_PROFILE:
@@ -401,12 +401,17 @@ def _c1_enabled_settings() -> dict | None:
     if C1_TELEGRAM_PLUGIN in _get_disabled_plugins():
         return None
     entry = _plugin_settings_entry(load_config_readonly() or {}, C1_TELEGRAM_PLUGIN)
-    if not isinstance(entry, dict):
+    if entry is None:
         return None
-    settings = entry.get("settings")
-    if not isinstance(settings, dict):
-        settings = entry.get("config")
-    if not isinstance(settings, dict) or settings.get("enabled") is not True:
+    # Match PluginContext.get_config(): each missing key falls back independently.
+    settings = {
+        key: _nested_plugin_value(
+            entry.get("settings"), (key,),
+            _nested_plugin_value(entry.get("config"), (key,), None),
+        )
+        for key in ("enabled", "agent_ops_repo")
+    }
+    if settings["enabled"] is not True:
         return None
     return settings
 

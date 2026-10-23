@@ -136,7 +136,8 @@ class _PluginContext:
         return SimpleNamespace(dispose=lambda: None)
 
 
-def test_enabled_c1_pin_mismatch_aborts_before_adapter_connect(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize("layout", ["settings", "empty-settings", "legacy-enabled", "legacy-repo"])
+def test_enabled_c1_pin_mismatch_aborts_before_adapter_connect(monkeypatch, tmp_path, caplog, layout):
     candidate = tmp_path / "hermes"
     (candidate / "gateway").mkdir(parents=True)
     (candidate / "hermes_cli").mkdir()
@@ -206,17 +207,19 @@ def test_enabled_c1_pin_mismatch_aborts_before_adapter_connect(monkeypatch, tmp_
     (profile_home / "gateway.pid").write_text(json.dumps({"pid": os.getpid()}))
     startup_steps = []
 
+    effective = context.settings.copy()
+    entry = {"settings": effective}
+    if layout == "empty-settings":
+        entry = {"settings": {}, "config": effective}
+    elif layout == "legacy-enabled":
+        entry = {"settings": {"agent_ops_repo": str(agent_ops)}, "config": effective}
+    elif layout == "legacy-repo":
+        entry = {"settings": {"enabled": True}, "config": effective}
     config = {
         "plugins": {
             "enabled": ["c1_telegram_personal"],
             "entries": {
-                "c1_telegram_personal": {
-                    "settings": {
-                        "enabled": True,
-                        "agent_ops_repo": str(agent_ops),
-                        "source_repo": str(source_repo),
-                    },
-                },
+                "c1_telegram_personal": entry,
             },
         },
     }
@@ -305,6 +308,28 @@ def test_enabled_c1_pin_mismatch_aborts_before_adapter_connect(monkeypatch, tmp_
         record.levelno == logging.ERROR and str(failure.value) in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_explicit_disabled_setting_overrides_enabled_legacy_config(monkeypatch, tmp_path):
+    import hermes_cli.plugins_discovery
+    import hermes_constants
+
+    monkeypatch.setattr(
+        hermes_constants, "get_hermes_home", lambda: tmp_path / "profiles" / "chief",
+    )
+    monkeypatch.setattr(
+        hermes_cli.plugins_discovery, "_get_enabled_plugins", lambda: {"c1_telegram_personal"},
+    )
+    monkeypatch.setattr(
+        hermes_cli.plugins_discovery, "_get_disabled_plugins", lambda: set(),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "plugins": {"entries": {"c1_telegram_personal": {
+            "settings": {"enabled": False},
+            "config": {"enabled": True, "agent_ops_repo": "/unused"},
+        }}},
+    })
+    assert run_inbound_consumer.c1_binding_startup_error() is None
 
 
 def _private_dir(path: Path) -> None:
