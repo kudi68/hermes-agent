@@ -177,7 +177,7 @@ def test_preflight_requires_exact_candidate_revisions(tmp_path):
     assert not calls.exists()
 
 
-@pytest.mark.parametrize("fault", ["clean", "tracked", "index", "untracked", "ignored"])
+@pytest.mark.parametrize("fault", ["clean", "tracked", "index", "untracked", "ignored", "ops-ignored"])
 def test_runtime_gate_with_real_temporary_checkouts(tmp_path, fault):
     runtime = tmp_path / "runtime"
     ops_runtime = tmp_path / "ops-runtime"
@@ -192,7 +192,7 @@ def test_runtime_gate_with_real_temporary_checkouts(tmp_path, fault):
     git(runtime, "init", "-q")
     (runtime / "gateway").mkdir()
     (runtime / "gateway/core.py").write_text("PINNED = True\n")
-    (runtime / ".gitignore").write_text("gateway/ignored.py\n")
+    (runtime / ".gitignore").write_text("gateway/ignored.py\ntools/agent_ops_c1/ignored.py\n")
     git(runtime, "add", "--", ".gitignore", "gateway/core.py")
     git(runtime, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
         "commit", "-qm", "runtime fixture")
@@ -205,6 +205,9 @@ def test_runtime_gate_with_real_temporary_checkouts(tmp_path, fault):
             git(runtime, "add", "--", "gateway/core.py")
     elif fault in ("untracked", "ignored"):
         (runtime / f"gateway/{fault}.py").write_text("INJECTED = True\n")
+    elif fault == "ops-ignored":
+        (ops_runtime / "tools/agent_ops_c1").mkdir(parents=True)
+        (ops_runtime / "tools/agent_ops_c1/ignored.py").write_text("INJECTED = True\n")
     script = Path(__file__).resolve().parents[2] / "scripts/c1-planB-preflight.sh"
     result = subprocess.run(
         ["/bin/bash", "--noprofile", "--norc", "-c",

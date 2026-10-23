@@ -33,7 +33,7 @@ if [[ ! "$hermes_runtime_head" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$ops_runtime_head" 
   exit 2
 fi
 
-ls -ld "$runtime_root" "$agent_ops_repo" "$python_bin" "$hermes_runtime" "$ops_runtime"
+ls -ld "$runtime_root" "$agent_ops_repo" "$python_bin"
 test "$(git -C "$runtime_root" rev-parse --verify 'HEAD^{commit}')" = "$candidate_sha"
 test "$(git -C "$agent_ops_repo" rev-parse --verify 'HEAD^{commit}')" = "$agent_ops_sha"
 for candidate_repo in "$runtime_root" "$agent_ops_repo"; do
@@ -60,7 +60,7 @@ check_runtime() {
   # Ignored code can also shadow imports. Bytecode caches do not block switching.
   ignored=$(git -C "$repo" -c core.fsmonitor=false status --porcelain=v1 \
     --untracked-files=all --ignored=matching -- \
-    gateway hermes_cli hermes_constants.py plugins/c1_telegram_personal plugins/platforms/telegram \
+    gateway hermes_cli hermes_constants.py plugins/c1_telegram_personal plugins/platforms/telegram tools \
     ':(exclude,glob)**/__pycache__' ':(exclude,glob)**/__pycache__/**')
   if [ -n "$ignored" ]; then
     printf 'FAIL runtime %s has untracked or ignored protected files:\n%s\n' "$repo" "$ignored" >&2
