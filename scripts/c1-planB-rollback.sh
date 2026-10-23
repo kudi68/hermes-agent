@@ -3,19 +3,24 @@
 set -euo pipefail
 
 runtime_root=/Users/kudi68-15mba/Projects/c1-runtime/hermes-agent-c1-fe6ab90
+agent_ops_runtime_root=/Users/kudi68-15mba/Projects/c1-runtime/agent-ops-c1-main-de5ba
 night_root=/Users/kudi68-15mba/Projects/night/20261022
 plist=/Users/kudi68-15mba/Library/LaunchAgents/local.hermes.c1-chief.plist
 plist_a="$night_root/plist-A/local.hermes.c1-chief.plist"
 base=b6e7d10e8b04fd10e7a1d72563a40c343a11181e
+agent_ops_base=d5f16ed0f7d7839280590545d44d3e6183d20773
 domain="gui/$(id -u)"
 label=local.hermes.c1-chief
 
-ls -ld "$runtime_root" "$plist" "$plist_a" "$plist_a.sha256"
+ls -ld "$runtime_root" "$agent_ops_runtime_root" "$plist" "$plist_a" "$plist_a.sha256"
 shasum -a 256 -c "$plist_a.sha256"
 plutil -lint "$plist_a"
 git -C "$runtime_root" diff --quiet
 git -C "$runtime_root" diff --cached --quiet
 git -C "$runtime_root" cat-file -e "$base^{commit}"
+git -C "$agent_ops_runtime_root" diff --quiet
+git -C "$agent_ops_runtime_root" diff --cached --quiet
+git -C "$agent_ops_runtime_root" cat-file -e "$agent_ops_base^{commit}"
 
 # A failed deployment may already have unloaded the job. Other failures must stop rollback.
 if bootout_error=$(launchctl bootout "$domain/$label" 2>&1); then
@@ -63,6 +68,8 @@ fi
 # Detached checkout preserves feat/c1-wiring and refuses conflicting untracked files.
 git -C "$runtime_root" checkout --detach "$base"
 test "$(git -C "$runtime_root" rev-parse HEAD)" = "$base"
+git -C "$agent_ops_runtime_root" checkout --detach "$agent_ops_base"
+test "$(git -C "$agent_ops_runtime_root" rev-parse HEAD)" = "$agent_ops_base"
 cp -p "$plist_a" "$plist"
 cmp -s "$plist_a" "$plist"
 plutil -lint "$plist"

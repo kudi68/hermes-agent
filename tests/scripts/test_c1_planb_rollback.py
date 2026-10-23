@@ -6,6 +6,9 @@ import subprocess
 import pytest
 
 
+HERMES_RUNTIME = "/Users/kudi68-15mba/Projects/c1-runtime/hermes-agent-c1-fe6ab90"
+AGENT_OPS_RUNTIME = "/Users/kudi68-15mba/Projects/c1-runtime/agent-ops-c1-main-de5ba"
+
 HARNESS = r"""
 set -euo pipefail
 scenario=$1
@@ -22,6 +25,9 @@ sleep() { record "sleep $*"; }
 git() {
   record "git $*"
   case "$*" in
+    *"agent-ops-c1-main-de5ba rev-parse HEAD")
+      printf 'd5f16ed0f7d7839280590545d44d3e6183d20773\n'
+      ;;
     *" rev-parse HEAD") printf 'b6e7d10e8b04fd10e7a1d72563a40c343a11181e\n' ;;
   esac
 }
@@ -114,18 +120,33 @@ def test_rollback_waits_for_unload_then_bootstraps_and_prints_pid(tmp_path, scen
     assert result.returncode == 0, result.stdout + result.stderr
 
     bootout = next(i for i, call in enumerate(calls) if call.startswith("launchctl bootout "))
-    checkout = next(i for i, call in enumerate(calls) if call.startswith("git -C ") and " checkout " in call)
+    hermes_checkout = next(
+        i for i, call in enumerate(calls)
+        if call.startswith(f"git -C {HERMES_RUNTIME} checkout ")
+    )
+    agent_ops_checkout = next(
+        i for i, call in enumerate(calls)
+        if call.startswith(f"git -C {AGENT_OPS_RUNTIME} checkout ")
+    )
     bootstrap = next(i for i, call in enumerate(calls) if call.startswith("launchctl bootstrap "))
-    assert bootout < checkout < bootstrap
+    assert bootout < hermes_checkout < agent_ops_checkout < bootstrap
 
     if scenario == "loaded":
         loaded = calls.index("print-result loaded")
         unloaded = calls.index("print-result unloaded")
-        assert bootout < loaded < unloaded < checkout < bootstrap
+        assert bootout < loaded < unloaded < hermes_checkout < agent_ops_checkout < bootstrap
     else:
         unloaded = calls.index("print-result unloaded")
-        assert bootout < unloaded < checkout < bootstrap
+        assert bootout < unloaded < hermes_checkout < agent_ops_checkout < bootstrap
 
+    assert (
+        f"git -C {HERMES_RUNTIME} "
+        "checkout --detach b6e7d10e8b04fd10e7a1d72563a40c343a11181e"
+    ) in calls
+    assert (
+        f"git -C {AGENT_OPS_RUNTIME} "
+        "checkout --detach d5f16ed0f7d7839280590545d44d3e6183d20773"
+    ) in calls
     assert calls.count("launchctl bootstrap gui/501 /Users/kudi68-15mba/Library/LaunchAgents/local.hermes.c1-chief.plist") == 1
     assert "launchctl print gui/501/local.hermes.c1-chief" in calls
     assert calls.index("print-result pid") > bootstrap
