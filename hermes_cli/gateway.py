@@ -16,6 +16,7 @@ import socket
 import shlex
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
@@ -39,7 +40,9 @@ from gateway.restart import (
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    is_c1_chief_launchd_job,
     is_gateway_supervisor_process,
+    map_fatal_config_exit_for_launchd,
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
@@ -261,6 +264,31 @@ def _request_gateway_self_restart(pid: int) -> bool:
     except (ProcessLookupError, PermissionError, OSError):
         return False
     return True
+
+
+def _c1_runtime_launch_refusal_reason(
+    *, parent_pid: int | None = None, project_root: Path | None = None, runtime_root: Path | None = None,
+) -> str | None:
+    """Require the C1 gateway code to run as a launchd child from the c1-runtime checkout."""
+    # Isolated real-boot tests are children of pytest, outside the live runtime tree.
+    if os.environ.get("HERMES_TEST_ONLY_ALLOW_C1_GATEWAY_BOOT_IN_TMP_HOME") == "1" and os.environ.get("HOME"):
+        try:
+            test_home = Path(os.environ["HOME"]).resolve()
+            tmp_roots = (Path(tempfile.gettempdir()).resolve(), Path("/private/tmp").resolve())
+            if any(test_home != root and test_home.is_relative_to(root) for root in tmp_roots):
+                return None
+        except (OSError, RuntimeError, ValueError):
+            pass  # An unresolvable HOME must still pass the normal launch checks.
+    parent_pid = os.getppid() if parent_pid is None else parent_pid
+    project_root = PROJECT_ROOT if project_root is None else Path(project_root)
+    runtime_root = Path.home() / "Projects" / "c1-runtime" if runtime_root is None else Path(runtime_root)
+    if parent_pid != 1:
+        return f"parent PID {parent_pid} is not launchd (expected 1)"
+    try:
+        project_root.resolve().relative_to(runtime_root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return f"gateway project root is outside c1-runtime: {project_root}"
+    return None
 
 
 def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float, *, on_progress=None) -> bool:
@@ -4550,6 +4578,13 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
     (``gateway.unmanaged_idle_exit_seconds``)."""
+    refusal = _c1_runtime_launch_refusal_reason()
+    if refusal:
+        logger.error("Refusing gateway startup: %s", refusal)
+        exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+        if is_c1_chief_launchd_job():
+            exit_code = map_fatal_config_exit_for_launchd(exit_code)
+        raise SystemExit(exit_code)
     _guard_official_docker_root_gateway()
     _attach_to_host_gateway_or_guard(force=force, replace=replace)
     _guard_supervised_gateway_conflict(force=force)

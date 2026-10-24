@@ -14,10 +14,12 @@ See issue #33778 for the original Windows session-loss bug report.
 import asyncio
 import json
 import os
+import signal
 import threading
 import time
 from unittest.mock import MagicMock
 
+import pytest
 
 from gateway.run import _run_planned_stop_watcher
 from gateway import status as status_mod
@@ -233,3 +235,150 @@ def test_cli_sigterm_after_watcher_consumed_the_marker_stays_planned(tmp_path, m
     bare, bare_flag = _handler()
     bare(signal.SIGTERM)
     assert bare_flag[0] is True
+
+
+def _launchd_signal_handler(monkeypatch, *, planned_stop):
+    from types import SimpleNamespace
+
+    import gateway.run as run_mod
+    import gateway.shutdown_forensics as forensics
+
+    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+    monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "local.hermes.c1-chief")
+    monkeypatch.setattr(status_mod, "consume_takeover_marker_for_self", lambda: False)
+    monkeypatch.setattr(status_mod, "consume_planned_stop_marker_for_self", lambda: planned_stop)
+    monkeypatch.setattr(forensics, "snapshot_shutdown_context", lambda *a, **k: None)
+    monkeypatch.setattr(run_mod.asyncio, "create_task", lambda coro: coro.close())
+    runner = SimpleNamespace(
+        _signal_initiated_shutdown=False,
+        _stop_requested_by_signal=False,
+        _restart_requested=False,
+        _restart_via_service=False,
+        should_exit_with_failure=False,
+        exit_reason=None,
+        exit_code=None,
+        stop=lambda: asyncio.sleep(0),
+    )
+    flag = [False]
+    handler = run_mod._start_gateway_make_shutdown_signal_handler(runner, flag)
+    return run_mod, runner, flag, handler
+
+
+def test_c1_launchd_external_planned_stop_exits_75(monkeypatch):
+    """A Desktop/CLI planned stop must hand control back to launchd for restart."""
+    import signal
+
+    run_mod, runner, flag, handler = _launchd_signal_handler(monkeypatch, planned_stop=True)
+    handler(signal.SIGTERM)
+
+    # The launchd-restart path does not classify this as an unexpected signal;
+    # exit 75 comes from runner._restart_via_service.
+    assert flag[0] is False
+    assert runner._restart_requested is True
+    assert runner._restart_via_service is True
+    with pytest.raises(SystemExit) as exc:
+        run_mod._resolve_gateway_exit_verdict(runner, flag[0])
+    assert exc.value.code == 75
+
+
+def test_c1_launchd_watcher_only_planned_stop_exits_75(tmp_path, monkeypatch):
+    """A real watcher callback must restart C1 even when the CLI never sends SIGTERM."""
+    consume_marker = status_mod.consume_planned_stop_marker_for_self
+    run_mod, runner, flag, handler = _launchd_signal_handler(monkeypatch, planned_stop=True)
+    monkeypatch.setattr(status_mod, "consume_planned_stop_marker_for_self", consume_marker)
+    marker = tmp_path / ".gateway-planned-stop.json"
+    monkeypatch.setattr(status_mod, "_get_planned_stop_marker_path", lambda: marker)
+    _write_self_marker(marker)
+    runner._running = True
+    runner._draining = False
+    loop = _make_loop_capturing_calls()
+
+    _run_planned_stop_watcher(threading.Event(), runner, loop, handler, poll_interval=0.01)
+    callback, args = loop._captured[0]
+    assert args == (None,)
+    callback(*args)
+
+    assert not marker.exists()
+    assert flag[0] is False
+    assert runner._restart_via_service is True
+    with pytest.raises(SystemExit) as exc:
+        run_mod._resolve_gateway_exit_verdict(runner, flag[0])
+    assert exc.value.code == 75
+
+
+@pytest.mark.parametrize("received_signal", [None, signal.SIGTERM])
+def test_non_c1_label_keeps_clean_planned_stop(monkeypatch, received_signal):
+    run_mod, runner, flag, handler = _launchd_signal_handler(monkeypatch, planned_stop=True)
+    monkeypatch.setenv("XPC_SERVICE_NAME", "ai.hermes.gateway")
+    monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
+    handler(received_signal)
+
+    assert flag[0] is False
+    assert runner._restart_requested is False
+    assert runner._restart_via_service is False
+    assert run_mod._resolve_gateway_exit_verdict(runner, flag[0]) is True
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+def test_c1_sigint_and_takeover_keep_clean_exit(monkeypatch, takeover):
+    import signal
+
+    run_mod, runner, flag, handler = _launchd_signal_handler(monkeypatch, planned_stop=True)
+    monkeypatch.setattr(status_mod, "consume_takeover_marker_for_self", lambda: takeover)
+    handler(signal.SIGTERM if takeover else signal.SIGINT)
+
+    assert flag[0] is False
+    assert runner._restart_via_service is False
+    assert run_mod._resolve_gateway_exit_verdict(runner, flag[0]) is True
+
+
+def test_c1_launchd_unmarked_sigterm_keeps_normal_stop_classification(monkeypatch):
+    """Bootout unloads the job before SIGTERM; the process keeps the unmarked-signal path."""
+    import signal
+
+    run_mod, runner, flag, handler = _launchd_signal_handler(monkeypatch, planned_stop=False)
+    handler(signal.SIGTERM)
+
+    assert flag[0] is True
+    assert runner._stop_requested_by_signal is True
+    assert runner._restart_requested is False
+    assert runner._restart_via_service is False
+    assert run_mod._resolve_gateway_exit_verdict(runner, flag[0]) is False
+
+
+def test_sigusr1_service_restart_still_exits_75():
+    """The existing SIGUSR1 restart continues to request the service restart route."""
+    from types import SimpleNamespace
+
+    import gateway.run as run_mod
+
+    runner = SimpleNamespace(
+        _restart_requested=False,
+        _restart_via_service=False,
+        should_exit_with_failure=False,
+        exit_reason=None,
+        exit_code=None,
+    )
+
+    def request_restart(*, detached, via_service):
+        runner._restart_requested = True
+        runner._restart_via_service = via_service
+        return True
+
+    runner.request_restart = request_restart
+    run_mod._start_gateway_make_restart_signal_handler(runner)()
+
+    with pytest.raises(SystemExit) as exc:
+        run_mod._resolve_gateway_exit_verdict(runner, False)
+    assert exc.value.code == 75
+
+
+def test_c1_chief_launchd_identity_accepts_direct_and_forwarded_labels():
+    from gateway.restart import is_c1_chief_launchd_job
+
+    label = "local.hermes.c1-chief"
+    assert is_c1_chief_launchd_job({"XPC_SERVICE_NAME": label}) is True
+    assert is_c1_chief_launchd_job(
+        {"XPC_SERVICE_NAME": "0", "HERMES_LAUNCHD_LABEL": label}
+    ) is True
+    assert is_c1_chief_launchd_job({"XPC_SERVICE_NAME": "0"}) is False

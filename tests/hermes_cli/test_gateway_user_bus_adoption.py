@@ -40,6 +40,7 @@ def test_service_gateway_boot_adopts_its_user_bus(monkeypatch):
         "_apply_startup_watchdog_config",
     ):
         monkeypatch.setattr(gw, guard, lambda *_a, **_kw: None)
+    monkeypatch.setattr(gw, "_c1_runtime_launch_refusal_reason", lambda: None)
 
     def _stop_here() -> bool:
         raise _BootReached

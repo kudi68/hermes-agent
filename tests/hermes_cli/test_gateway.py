@@ -24,6 +24,7 @@ def inert_task_scheduler_probe():
     call ``.undo()`` on this fixture to reach the real function."""
     mp = pytest.MonkeyPatch()
     mp.setattr(gateway, "_windows_scheduled_task_state", lambda name: None)
+    mp.setattr(gateway, "_c1_runtime_launch_refusal_reason", lambda: None)
     yield mp
     mp.undo()
 
@@ -43,6 +44,8 @@ def _run_native_windows_gateway_start_diag(
         import types
 
         import hermes_cli.gateway as gateway_cli
+
+        gateway_cli._c1_runtime_launch_refusal_reason = lambda: None
 
         async def start_gateway(**kwargs):
             assert "_HERMES_GATEWAY_BREAKAWAY" not in os.environ
@@ -155,6 +158,8 @@ def test_gateway_run_subprocess_preserves_daemon_exit_codes(
         import types
 
         import hermes_cli.gateway as gateway_cli
+
+        gateway_cli._c1_runtime_launch_refusal_reason = lambda: None
 
         outcome = os.environ["HERMES_TEST_GATEWAY_OUTCOME"]
 
